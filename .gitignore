@@ -42,7 +42,6 @@ double-sided/
 # Traffic Captures & Logs
 *.log
 *.mitm
-*.txt
 mitmproxy/
 flows/
 
