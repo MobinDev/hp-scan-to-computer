@@ -7,5 +7,5 @@ services:
     environment:
       - TZ=Europe/Berlin
     volumes:
-      - ./config.json:/app/config.json:ro
-      - ./consume:/consume
+      - ${CONFIG_PATH:-./config.json}:/app/config.json:ro
+      - ${CONSUME_PATH:-./consume}:/consume
