@@ -1,6 +1,3 @@
-یک فایل `README.md` کامل و استاندارد برای پروژه:
-
-```markdown
 # HP Scan To Computer (`hpscan`)
 
 A lightweight Python service packaged in Docker that connects modern HP printers (e.g., HP OfficeJet Pro 8120e / 8122e series) to home servers and document management systems like **Paperless-ngx**.
