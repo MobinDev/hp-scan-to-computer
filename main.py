@@ -245,7 +245,6 @@ class ESCLWalkupScanner:
 
                     if event_type == "HostSelected":
                         logger.info("Host selected on printer panel.")
-                        # پاکسازی بافر نشست قبل در صورت وجود
                         if self.current_session_pages:
                             await self.finalize_session()
                     elif event_type == "ScanRequested":
@@ -257,11 +256,21 @@ class ESCLWalkupScanner:
                     elif event_type == "ScanPagesComplete":
                         logger.info("ScanPagesComplete event received. Finalizing batch PDF...")
                         await self.finalize_session()
+                elif resp.status_code in (404, 410):
+                    logger.warning(
+                        f"Subscription expired or printer restarted (HTTP {resp.status_code}). "
+                        "Re-registering subscription..."
+                    )
+                    break  # خروج از حلقه برای ثبت اشتراک مجدد
                 else:
                     logger.warning(f"Unexpected event response: HTTP {resp.status_code}")
                     await asyncio.sleep(2)
             except httpx.TimeoutException:
                 continue
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError) as e:
+                logger.warning(f"Printer offline or unreachable: {e}. Will retry subscription in 10s...")
+                await asyncio.sleep(10)
+                break  # خروج از حلقه جهت تلاش مجدد برای اتصالات بعدی
             except Exception as e:
                 if self.running:
                     logger.error(f"Error during long-poll: {e}")
