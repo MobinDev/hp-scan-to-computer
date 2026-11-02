@@ -1,8 +1,11 @@
 services:
-  hpscan-escl:
-    build: .
-    image: hpscan-escl:latest
-    container_name: hpscan-escl
+  hp-scan-to-computer:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hp-scan-to-computer:latest
+    container_name: hp-scan-to-computer
+    pull_policy: build
     restart: unless-stopped
     environment:
       - TZ=Europe/Berlin
