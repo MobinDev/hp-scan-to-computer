@@ -80,8 +80,6 @@ Create `config.json` in your project root directory (or use `config.example.json
 ### `docker-compose.yml`
 
 ```yaml
-version: "3.8"
-
 services:
   hpscan:
     build: .
