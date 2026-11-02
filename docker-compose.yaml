@@ -1,0 +1,19 @@
+version: "3.8"
+
+services:
+  hpscan-escl:
+    build: .
+    image: hpscan-escl:latest
+    container_name: hpscan-escl
+    restart: unless-stopped
+    environment:
+      - TZ=Europe/Berlin
+    volumes:
+      - /home/mobin/Projects/hpscan/config.json:/app/config.json:ro
+      - /home/mobin/Projects/hpscan/consume:/consume
+    # networks:
+    #   - npm-paperless
+
+# networks:
+#   npm-paperless:
+#     external: true
