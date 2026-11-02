@@ -90,7 +90,7 @@ services:
       - TZ=Europe/Berlin
     volumes:
       - ./config.json:/app/config.json:ro
-      - /opt/projects/paperless/consume:/consume
+      - ./consume:/consume
 
 ```
 

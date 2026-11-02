@@ -7,5 +7,5 @@ services:
     environment:
       - TZ=Europe/Berlin
     volumes:
-      - /home/mobin/Projects/hpscan/config.json:/app/config.json:ro
-      - /home/mobin/Projects/hpscan/consume:/consume
+      - ./config.json:/app/config.json:ro
+      - ./consume:/consume
