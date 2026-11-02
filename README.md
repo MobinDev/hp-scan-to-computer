@@ -1,4 +1,4 @@
-# HP Scan To Computer (`hpscan`)
+# HP Scan To Computer (`docker`)
 
 A lightweight Python service packaged in Docker that connects modern HP printers (e.g., HP OfficeJet Pro 8120e / 8122e series) to home servers and document management systems like **Paperless-ngx**.
 
