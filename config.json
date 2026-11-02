@@ -2,7 +2,6 @@
   "printer_url": "https://192.168.2.199:443",
   "host_identifier": "Debian-Homelab (Paperless-Scanner)",
   "verify_ssl": false,
-  "poll_interval_sec": 2,
   "puid": 1000,
   "pgid": 1000,
   "shortcuts": {
