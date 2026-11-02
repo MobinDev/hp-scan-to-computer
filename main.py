@@ -42,11 +42,10 @@ class ESCLWalkupScanner:
         self.subscription_id = None
         self.running = True
 
-        # بافر برای نگهداری صفحات یک نشست اسکن چندصفحه‌ای
         self.current_session_pages = []
         self.current_shortcut_cfg = None
 
-    async def register_subscription(self):
+    async def register_subscription(self) -> bool:
         url = f"{self.printer_url}/eSCL/WalkupSubscriptions"
         shortcuts_xml = "".join(
             f"<Shortcut>{name}</Shortcut>" for name in self.shortcuts.keys()
@@ -62,16 +61,22 @@ class ESCLWalkupScanner:
 
         logger.info(f"Registering walkup subscription for '{self.host_id}'...")
         headers = {"Content-Type": "text/xml", "Cache-Control": "no-cache"}
-        resp = await self.client.post(url, content=body, headers=headers)
-
-        if resp.status_code == 201 and "Location" in resp.headers:
-            loc = resp.headers["Location"]
-            self.subscription_url = loc if loc.startswith("http") else f"{self.printer_url}{loc}"
-            self.subscription_id = self.subscription_url.split("/")[-1]
-            logger.info(f"Successfully subscribed. Subscription ID: {self.subscription_id}")
-            return True
-        else:
-            logger.error(f"Failed to subscribe: HTTP {resp.status_code} - {resp.text}")
+        try:
+            resp = await self.client.post(url, content=body, headers=headers)
+            if resp.status_code == 201 and "Location" in resp.headers:
+                loc = resp.headers["Location"]
+                self.subscription_url = loc if loc.startswith("http") else f"{self.printer_url}{loc}"
+                self.subscription_id = self.subscription_url.split("/")[-1]
+                logger.info(f"Successfully subscribed. Subscription ID: {self.subscription_id}")
+                return True
+            else:
+                logger.error(f"Failed to subscribe: HTTP {resp.status_code} - {resp.text}")
+                return False
+        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError) as e:
+            logger.warning(f"Printer offline or unreachable during subscription: {e}")
+            return False
+        except Exception as e:
+            logger.error(f"Unexpected error during subscription: {e}")
             return False
 
     async def delete_subscription(self):
@@ -160,7 +165,11 @@ class ESCLWalkupScanner:
         logger.info(f"Submitting ScanJob ({shortcut_name}, Source: {input_source}, Duplex: {duplex}, Height: {height})...")
         jobs_url = f"{self.printer_url}/eSCL/ScanJobs"
         headers = {"Content-Type": "text/xml"}
-        resp = await self.client.post(jobs_url, content=scan_settings_xml, headers=headers)
+        try:
+            resp = await self.client.post(jobs_url, content=scan_settings_xml, headers=headers)
+        except Exception as e:
+            logger.error(f"Network error creating scan job: {e}")
+            return
 
         if resp.status_code != 201 or "Location" not in resp.headers:
             logger.error(f"Failed to create scan job: HTTP {resp.status_code} - {resp.text}")
@@ -261,7 +270,7 @@ class ESCLWalkupScanner:
                         f"Subscription expired or printer restarted (HTTP {resp.status_code}). "
                         "Re-registering subscription..."
                     )
-                    break  # خروج از حلقه برای ثبت اشتراک مجدد
+                    break
                 else:
                     logger.warning(f"Unexpected event response: HTTP {resp.status_code}")
                     await asyncio.sleep(2)
@@ -270,7 +279,7 @@ class ESCLWalkupScanner:
             except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError) as e:
                 logger.warning(f"Printer offline or unreachable: {e}. Will retry subscription in 10s...")
                 await asyncio.sleep(10)
-                break  # خروج از حلقه جهت تلاش مجدد برای اتصالات بعدی
+                break
             except Exception as e:
                 if self.running:
                     logger.error(f"Error during long-poll: {e}")
@@ -282,8 +291,9 @@ class ESCLWalkupScanner:
             if subscribed:
                 await self.poll_events()
             else:
-                logger.error("Subscription failed. Retrying in 15 seconds...")
-                await asyncio.sleep(15)
+                if self.running:
+                    logger.warning("Subscription failed or printer offline. Retrying in 15 seconds...")
+                    await asyncio.sleep(15)
 
     async def stop(self):
         self.running = False
