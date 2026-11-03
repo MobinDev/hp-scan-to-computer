@@ -524,37 +524,37 @@ class ESCLWalkupScanner:
         )
 
         xml = f"""<?xml version="1.0" encoding="UTF-8"?>
-    <ScanSettings xmlns="{NS_ESCL}"
-                xmlns:escl="{NS_ESCL}"
-                xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
-        <Version xmlns="{NS_PWG}">2.9</Version>
-        <ContextID>{escape(str(self.subscription_id or ""))}</ContextID>
-        <ScanRegions xmlns="{NS_PWG}" xmlns:n0="{NS_PWG}" n0:MustHonor="false">
-            <ScanRegion>
-                <Height>{paper_height}</Height>
-                <Width>{paper_width}</Width>
-                <XOffset>0</XOffset>
-                <YOffset>0</YOffset>
-                <ContentRegionUnits>escl:ThreeHundredthsOfInches</ContentRegionUnits>
-            </ScanRegion>
-        </ScanRegions>
-        <DocumentFormatExt>image/jpeg</DocumentFormatExt>
-        <InputSource xmlns="{NS_PWG}">{input_source}</InputSource>
-        <XResolution>{resolution}</XResolution>
-        <YResolution>{resolution}</YResolution>
-        <ColorMode>{escape(color_mode)}</ColorMode>
-        {duplex_xml}
-        <Brightness>4</Brightness>
-        <CompressionFactor>50</CompressionFactor>
-        <Contrast>4</Contrast>
-        <JobSourceInfo>
-            <UserName>LOCAL SERVICE</UserName>
-            <UserDomain></UserDomain>
-            <MachineName>{escape(str(self.host_id))}</MachineName>
-            <AppFileName>svchost.exe</AppFileName>
-            <Application>WIA client</Application>
-        </JobSourceInfo>
-    </ScanSettings>"""
+<ScanSettings xmlns="{NS_ESCL}"
+            xmlns:escl="{NS_ESCL}"
+            xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+    <Version xmlns="{NS_PWG}">2.9</Version>
+    <ContextID>{escape(str(self.subscription_id or ""))}</ContextID>
+    <ScanRegions xmlns="{NS_PWG}" xmlns:n0="{NS_PWG}" n0:MustHonor="false">
+        <ScanRegion>
+            <Height>{paper_height}</Height>
+            <Width>{paper_width}</Width>
+            <XOffset>0</XOffset>
+            <YOffset>0</YOffset>
+            <ContentRegionUnits>escl:ThreeHundredthsOfInches</ContentRegionUnits>
+        </ScanRegion>
+    </ScanRegions>
+    <DocumentFormatExt>image/jpeg</DocumentFormatExt>
+    <InputSource xmlns="{NS_PWG}">{input_source}</InputSource>
+    <XResolution>{resolution}</XResolution>
+    <YResolution>{resolution}</YResolution>
+    <ColorMode>{escape(color_mode)}</ColorMode>
+    {duplex_xml}
+    <Brightness>4</Brightness>
+    <CompressionFactor>50</CompressionFactor>
+    <Contrast>4</Contrast>
+    <JobSourceInfo>
+        <UserName>LOCAL SERVICE</UserName>
+        <UserDomain></UserDomain>
+        <MachineName>{escape(str(self.host_id))}</MachineName>
+        <AppFileName>svchost.exe</AppFileName>
+        <Application>WIA client</Application>
+    </JobSourceInfo>
+</ScanSettings>"""
 
         return xml, {
             "paper_size": paper_size,
