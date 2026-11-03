@@ -22,7 +22,6 @@ It listens for "Scan to Computer" events initiated directly from the printer's t
 ```text
 .
 ├── config.json           # Active configuration file (Printer IP, shortcuts, directories)
-├── config.example.json   # Configuration template
 ├── main.py               # Main eSCL listener service
 ├── Dockerfile            # Container build instructions
 ├── docker-compose.yml    # Docker Compose / Portainer deployment
@@ -35,25 +34,24 @@ It listens for "Scan to Computer" events initiated directly from the printer's t
 
 ## Configuration (`config.json`)
 
-Create `config.json` in your project root directory (or use `config.example.json` as a starting point):
+Create `config.json` in your project root directory (or use `config.json` as a starting point):
 
 ```json
 {
   "printer_url": "[https://192.168.2.199:443](https://192.168.2.199:443)",
   "host_identifier": "Homelab-Scanner",
   "verify_ssl": false,
-  "poll_interval_sec": 2,
   "puid": 1000,
   "pgid": 1000,
   "shortcuts": {
     "paperless": {
-      "duplex": false,  # true is not tested
+      "duplex": false,
       "resolution": 300,
       "color_mode": "RGB24",
       "output_dir": "/consume"
     },
     "paperless duplex": {
-      "duplex": false, 
+      "duplex": false,
       "resolution": 300,
       "color_mode": "RGB24",
       "output_dir": "/consume/double-sided"
@@ -62,6 +60,31 @@ Create `config.json` in your project root directory (or use `config.example.json
 }
 
 ```
+
+### Global Parameters
+
+| Parameter | Type | Default | Description |
+| --- | --- | --- | --- |
+| `printer_url` | String | - | Full HTTPS URL of your HP printer (e.g., `https://192.168.2.199:443`). |
+| `host_identifier` | String | `"Homelab-Scanner"` | Hostname shown on the printer's touchscreen under destination menu. |
+| `verify_ssl` | Boolean | `false` | Set to `false` for self-signed certificates on local network printers. |
+| `puid` / `pgid` | Integer | `1000` | Linux User ID and Group ID applied to saved PDF files via `chown`. |
+| `shortcuts` | Object | - | Map of scan profiles (up to **5 max**) displayed on the printer touchscreen. |
+
+### Shortcut Parameters
+
+| Option | Type | Values | Description |
+| :--- | :--- | :--- | :--- |
+| `duplex` | Boolean | `true`, `false` | Enables duplex scanning (ADF feeder only). *Note: Currently tested with `false`.* |
+| `resolution` | Integer | `75`, `150`, `200`, `300`, `600`, `1200` | DPI resolution. `300` is recommended for general documents and OCR. |
+| `color_mode` | String | `"RGB24"`, `"Grayscale8"`, `"BlackAndWhite1"` | • `"RGB24"`: Full 24-bit color.<br>• `"Grayscale8"`: 8-bit grayscale (~60-70% smaller file size).<br>• `"BlackAndWhite1"`: 1-bit monochrome. |
+| `output_dir` | String | - | Target container directory path where output PDFs are saved. |
+
+
+> **Note on Device Capabilities:**  
+> The supported resolutions, color modes, and dimensions listed above reflect the hardware capabilities of the **HP OfficeJet Pro 8120e / 8122e series**. If you are using a different printer model, you can query your printer's supported features by opening `https://<PRINTER_IP>/eSCL/ScannerCapabilities` in your browser or via a GET request.
+
+---
 
 ### Configuration Parameters
 
