@@ -44,10 +44,6 @@ PAPER_SIZES = {
     "STATEMENT": (1650, 2550),
 }
 
-# The physical platen is limited to A4.
-PLATEN_MAX_WIDTH = PAPER_SIZES["A4"][0]
-PLATEN_MAX_HEIGHT = PAPER_SIZES["A4"][1]
-
 
 def local_name(tag: str) -> str:
     """Return an XML tag name without its namespace."""
@@ -60,6 +56,7 @@ def find_text(root: ET.Element, wanted_name: str):
         if local_name(element.tag) == wanted_name:
             return element.text.strip() if element.text else None
     return None
+
 
 def find_int(root: ET.Element, wanted_name: str):
     value = find_text(root, wanted_name)
@@ -77,50 +74,80 @@ def descendants_text(root: ET.Element, wanted_name: str):
     ]
 
 
-def parse_source_capabilities(root: ET.Element, caps_name: str) -> dict:
+def parse_source_capabilities(
+    root: ET.Element,
+    caps_name: str,
+    *,
+    supports_duplex: bool = False,
+):
+    """Parse capabilities for one physical input source, if advertised."""
     caps_node = next(
-        (
-            node for node in root.iter()
-            if local_name(node.tag) == caps_name
-        ),
+        (node for node in root.iter() if local_name(node.tag) == caps_name),
         None,
     )
 
+    # A device is not required to expose every source (e.g. no flatbed or
+    # no duplex ADF), so missing capability blocks are not fatal here.
     if caps_node is None:
-        raise RuntimeError(
-            f"ScannerCapabilities does not contain {caps_name}."
-        )
+        return None
 
     limits = {}
-
-    for name in ("MinWidth", "MaxWidth", "MinHeight", "MaxHeight"):
+    limit_names = (
+        "MinWidth", "MaxWidth", "MinHeight", "MaxHeight",
+        "MinPageWidth", "MaxPageWidth",
+        "MinPageHeight", "MaxPageHeight",
+        "MaxScanRegions",
+    )
+    for name in limit_names:
         value = find_int(caps_node, name)
         if value is not None:
             limits[name] = value
 
-    resolutions = []
+    resolutions = set()
+    resolution_ranges = []
 
     for node in caps_node.iter():
-        if local_name(node.tag) in ("DiscreteResolution", "Resolution"):
+        node_type = local_name(node.tag)
+        if node_type in ("DiscreteResolution", "Resolution"):
             x = find_int(node, "XResolution")
             y = find_int(node, "YResolution")
-
             if x and y and x == y:
-                resolutions.append(x)
+                resolutions.add(x)
 
-    if not resolutions:
-        resolutions = [
-            int(value)
-            for value in descendants_text(caps_node, "XResolution")
+        elif node_type == "ResolutionRange":
+            min_x = find_int(node, "MinXResolution")
+            max_x = find_int(node, "MaxXResolution")
+            min_y = find_int(node, "MinYResolution")
+            max_y = find_int(node, "MaxYResolution")
+
+            if None not in (min_x, max_x, min_y, max_y):
+                # This implementation requests the same DPI on both axes.
+                lower = max(min_x, min_y)
+                upper = min(max_x, max_y)
+                if lower <= upper:
+                    resolution_ranges.append({"min": lower, "max": upper})
+
+    # Some firmware places X/Y values directly under the capability block
+    # instead of wrapping them in DiscreteResolution elements.
+    if not resolutions and not resolution_ranges:
+        direct_x = [
+            int(value) for value in descendants_text(caps_node, "XResolution")
             if value.isdigit()
         ]
+        direct_y = [
+            int(value) for value in descendants_text(caps_node, "YResolution")
+            if value.isdigit()
+        ]
+        resolutions.update(x for x in direct_x if x in direct_y)
 
     color_modes = descendants_text(caps_node, "ColorMode")
 
     return {
         **limits,
-        "resolutions": sorted(set(resolutions)),
+        "resolutions": sorted(resolutions),
+        "resolution_ranges": resolution_ranges,
         "color_modes": list(dict.fromkeys(color_modes)),
+        "supports_duplex": supports_duplex,
     }
 
 
@@ -169,34 +196,44 @@ class ESCLWalkupScanner:
             return self.capabilities_cache
 
         url = f"{self.printer_url}/eSCL/ScannerCapabilities"
-
         response = await self.client.get(url)
         response.raise_for_status()
-
         root = ET.fromstring(response.content)
 
-        capabilities = {
-            "Platen": parse_source_capabilities(
-                root, "PlatenInputCaps"
-            ),
-            "Feeder": parse_source_capabilities(
-                root, "AdfSimplexInputCaps"
-            ),
+        capability_blocks = {
+            "Platen": ("PlatenInputCaps", False),
+            "FeederSimplex": ("AdfSimplexInputCaps", False),
+            "FeederDuplex": ("AdfDuplexInputCaps", True),
         }
+
+        capabilities = {}
+        for source, (xml_name, is_duplex) in capability_blocks.items():
+            parsed = parse_source_capabilities(
+                root, xml_name, supports_duplex=is_duplex
+            )
+            if parsed is not None:
+                capabilities[source] = parsed
+
+        if not capabilities:
+            raise RuntimeError(
+                "ScannerCapabilities did not advertise any supported input source."
+            )
 
         self.capabilities_cache = capabilities
 
         for source, caps in capabilities.items():
             logger.info(
-                "%s capabilities: resolutions=%s, color_modes=%s, "
-                "width=%s..%s, height=%s..%s",
+                "%s capabilities: resolutions=%s, ranges=%s, color_modes=%s, "
+                "width=%s..%s, height=%s..%s, duplex=%s",
                 source,
                 caps["resolutions"],
+                caps["resolution_ranges"],
                 caps["color_modes"],
                 caps.get("MinWidth"),
                 caps.get("MaxWidth"),
                 caps.get("MinHeight"),
                 caps.get("MaxHeight"),
+                caps["supports_duplex"],
             )
 
         return capabilities
@@ -208,10 +245,7 @@ class ESCLWalkupScanner:
         caps: dict,
     ):
         paper_size = str(
-            shortcut_cfg.get(
-                "paper_size",
-                self.default_paper_size,
-            )
+            shortcut_cfg.get("paper_size", self.default_paper_size)
         ).upper()
 
         if paper_size not in PAPER_SIZES:
@@ -222,60 +256,70 @@ class ESCLWalkupScanner:
 
         width, height = PAPER_SIZES[paper_size]
 
+        # ScanRegion limits are source-specific and come directly from the
+        # corresponding Platen/ADF capability block. No A4 hard limit.
         min_width = caps.get("MinWidth", 0)
         min_height = caps.get("MinHeight", 0)
-        max_width = caps.get("MaxWidth", width)
-        max_height = caps.get("MaxHeight", height)
+        max_width = caps.get("MaxWidth")
+        max_height = caps.get("MaxHeight")
 
-        if input_source == "Platen":
-            max_width = min(max_width, PLATEN_MAX_WIDTH)
-            max_height = min(max_height, PLATEN_MAX_HEIGHT)
+        # Page limits, when advertised and non-zero, further constrain the
+        # physical sheet size. Zero values mean that the field is not bounded.
+        min_page_width = caps.get("MinPageWidth", 0)
+        min_page_height = caps.get("MinPageHeight", 0)
+        max_page_width = caps.get("MaxPageWidth") or None
+        max_page_height = caps.get("MaxPageHeight") or None
 
-        if not (
-            min_width <= width <= max_width
-            and min_height <= height <= max_height
-        ):
+        valid = (
+            width >= min_width
+            and height >= min_height
+            and (max_width is None or width <= max_width)
+            and (max_height is None or height <= max_height)
+            and width >= min_page_width
+            and height >= min_page_height
+            and (max_page_width is None or width <= max_page_width)
+            and (max_page_height is None or height <= max_page_height)
+        )
+
+        if not valid:
             raise ValueError(
-                f"{paper_size} is not supported by {input_source}. "
-                f"Allowed width: {min_width}..{max_width}, "
-                f"height: {min_height}..{max_height}."
+                f"{paper_size} is outside the capabilities of {input_source}. "
+                f"ScanRegion width: {min_width}..{max_width or 'unbounded'}, "
+                f"height: {min_height}..{max_height or 'unbounded'}; "
+                f"page width: {min_page_width}..{max_page_width or 'unbounded'}, "
+                f"height: {min_page_height}..{max_page_height or 'unbounded'}."
             )
 
         return paper_size, width, height
 
-
     @staticmethod
     def _select_resolution(requested: int, caps: dict) -> int:
         supported = caps.get("resolutions", [])
-
-        if not supported:
-            raise ValueError(
-                "Scanner did not advertise supported resolutions."
-            )
+        ranges = caps.get("resolution_ranges", [])
 
         if requested in supported:
             return requested
 
-        lower_or_equal = [
-            value for value in supported if value <= requested
-        ]
+        candidates = list(supported)
+        for item in ranges:
+            lower = item["min"]
+            upper = item["max"]
+            candidates.append(min(max(requested, lower), upper))
 
-        selected = (
-            max(lower_or_equal)
-            if lower_or_equal
-            else min(supported)
-        )
+        if not candidates:
+            raise ValueError(
+                "Scanner did not advertise supported resolutions or resolution ranges."
+            )
+
+        lower_or_equal = [value for value in candidates if value <= requested]
+        selected = max(lower_or_equal) if lower_or_equal else min(candidates)
 
         logger.warning(
-            "Resolution %s is unsupported. Using %s instead. "
-            "Supported: %s",
-            requested,
-            selected,
-            supported,
+            "Requested resolution %s is unsupported. Using %s instead. "
+            "Discrete values: %s; ranges: %s",
+            requested, selected, supported, ranges,
         )
-
         return selected
-
 
     @staticmethod
     def _select_color_mode(requested: str, caps: dict) -> str:
@@ -463,12 +507,21 @@ class ESCLWalkupScanner:
             )
         )
 
-        if input_source == "Feeder" and shortcut_cfg.get("duplex", False):
+        duplex = bool(shortcut_cfg.get("duplex", False))
+
+        if duplex and input_source != "Feeder":
+            raise ValueError("Duplex scanning is available only through the ADF.")
+        if duplex and not caps.get("supports_duplex", False):
             raise ValueError(
-                "Hardware duplex scanning is not supported by this scanner."
+                "Duplex was requested, but ScannerCapabilities does not advertise "
+                "AdfDuplexInputCaps for this printer."
             )
 
-        duplex_xml = ""
+        duplex_xml = (
+            f"<Duplex>{'true' if duplex else 'false'}</Duplex>"
+            if input_source == "Feeder"
+            else ""
+        )
 
         xml = f"""<?xml version="1.0" encoding="UTF-8"?>
     <ScanSettings xmlns="{NS_ESCL}"
@@ -509,6 +562,7 @@ class ESCLWalkupScanner:
             "paper_height": paper_height,
             "resolution": resolution,
             "color_mode": color_mode,
+            "duplex": duplex,
         }
 
     async def handle_scan_request(self, shortcut_name: str):
@@ -520,22 +574,43 @@ class ESCLWalkupScanner:
 
         try:
             input_source = await self.check_scanner_status()
-
             all_caps = await self.get_scanner_capabilities()
-            source_caps = all_caps[input_source]
+
+            duplex_requested = bool(shortcut_cfg.get("duplex", False))
+            if input_source == "Feeder":
+                caps_key = "FeederDuplex" if duplex_requested else "FeederSimplex"
+                if caps_key not in all_caps:
+                    if duplex_requested:
+                        raise ValueError(
+                            "Duplex was requested, but this printer does not advertise "
+                            "AdfDuplexInputCaps. Disable duplex in this shortcut or use "
+                            "a duplex-capable ADF."
+                        )
+                    raise ValueError(
+                        "The printer does not advertise AdfSimplexInputCaps."
+                    )
+                source_caps = all_caps[caps_key]
+            else:
+                if duplex_requested:
+                    raise ValueError(
+                        "Duplex was requested, but no document is loaded in the ADF. "
+                        "Duplex scanning cannot use the platen."
+                    )
+                if "Platen" not in all_caps:
+                    raise ValueError(
+                        "The printer does not advertise PlatenInputCaps."
+                    )
+                source_caps = all_caps["Platen"]
 
             scan_settings_xml, selected = self._build_scan_settings(
-                input_source,
-                shortcut_cfg,
-                source_caps,
+                input_source, shortcut_cfg, source_caps
             )
 
             effective_shortcut_cfg = dict(shortcut_cfg)
-            effective_shortcut_cfg["resolution"] = selected["resolution"]
-            effective_shortcut_cfg["color_mode"] = selected["color_mode"]
-            effective_shortcut_cfg["paper_size"] = selected["paper_size"]
+            effective_shortcut_cfg.update(selected)
             effective_shortcut_cfg["_input_source"] = input_source
 
+            # Compare resolved settings, not just the shortcut name/config.
             if (
                 self.current_session_pages
                 and self.current_shortcut_cfg != effective_shortcut_cfg
