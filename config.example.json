@@ -4,15 +4,18 @@
   "verify_ssl": false,
   "puid": 1000,
   "pgid": 1000,
+  "paper_size": "A4",
   "shortcuts": {
     "paperless": {
       "duplex": false,
+      "paper_size": "A4",
       "resolution": 300,
       "color_mode": "RGB24",
       "output_dir": "/consume"
     },
     "paperless duplex": {
       "duplex": false,
+      "paper_size": "A4",
       "resolution": 300,
       "color_mode": "RGB24",
       "output_dir": "/consume/double-sided"
