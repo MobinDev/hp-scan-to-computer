@@ -617,7 +617,7 @@ class ESCLWalkupScanner:
             "duplex": duplex,
         }
 
-        async def handle_scan_request(self, shortcut_name: str):
+    async def handle_scan_request(self, shortcut_name: str):
         shortcut_cfg = self._get_shortcut_config(shortcut_name)
 
         if not isinstance(shortcut_cfg, dict):
