@@ -27,8 +27,6 @@ logger = logging.getLogger("escl-walkup")
 NS_ESCL = "http://schemas.hp.com/imaging/escl/2011/05/03"
 NS_PWG = "http://www.pwg.org/schemas/2010/12/sm"
 
-# eSCL ScanRegion coordinates use 1/300-inch units, independently of
-# Dimensions in eSCL 1/300-inch units.
 PAPER_SIZES = {
     "A3": (3508, 4961),
     "A4": (2480, 3508),
@@ -102,8 +100,6 @@ def parse_source_capabilities(
         None,
     )
 
-    # A device is not required to expose every source (e.g. no flatbed or
-    # no duplex ADF), so missing capability blocks are not fatal here.
     if caps_node is None:
         return None
 
@@ -137,14 +133,11 @@ def parse_source_capabilities(
             max_y = find_int(node, "MaxYResolution")
 
             if None not in (min_x, max_x, min_y, max_y):
-                # This implementation requests the same DPI on both axes.
                 lower = max(min_x, min_y)
                 upper = min(max_x, max_y)
                 if lower <= upper:
                     resolution_ranges.append({"min": lower, "max": upper})
 
-    # Some firmware places X/Y values directly under the capability block
-    # instead of wrapping them in DiscreteResolution elements.
     if not resolutions and not resolution_ranges:
         direct_x = [
             int(value) for value in descendants_text(caps_node, "XResolution")
@@ -277,15 +270,11 @@ class ESCLWalkupScanner:
 
         width, height = PAPER_SIZES[paper_size]
 
-        # ScanRegion limits are source-specific and come directly from the
-        # corresponding Platen/ADF capability block. No A4 hard limit.
         min_width = caps.get("MinWidth", 0)
         min_height = caps.get("MinHeight", 0)
         max_width = caps.get("MaxWidth")
         max_height = caps.get("MaxHeight")
 
-        # Page limits, when advertised and non-zero, further constrain the
-        # physical sheet size. Zero values mean that the field is not bounded.
         min_page_width = caps.get("MinPageWidth", 0)
         min_page_height = caps.get("MinPageHeight", 0)
         max_page_width = caps.get("MaxPageWidth") or None
@@ -483,7 +472,6 @@ class ESCLWalkupScanner:
             response.raise_for_status()
             root = ET.fromstring(response.content)
         except (httpx.HTTPError, ET.ParseError) as exc:
-            # Do not silently switch to the platen when status could not be read.
             raise RuntimeError(f"Could not read scanner status: {exc}") from exc
 
         adf_state = find_text(root, "AdfState")
@@ -493,11 +481,9 @@ class ESCLWalkupScanner:
         return "Platen"
 
     def _get_shortcut_config(self, shortcut_name: str) -> dict:
-        # Exact match first.
         if shortcut_name in self.shortcuts:
             return self.shortcuts[shortcut_name]
 
-        # Then use the longest configured name contained in the received name.
         lowered_name = shortcut_name.casefold()
         matches = [
             (key, value)
@@ -621,10 +607,7 @@ class ESCLWalkupScanner:
         shortcut_cfg = self._get_shortcut_config(shortcut_name)
 
         if not isinstance(shortcut_cfg, dict):
-            logger.error(
-                "Shortcut '%s' configuration must be an object.",
-                shortcut_name,
-            )
+            logger.error("Shortcut '%s' configuration must be an object.", shortcut_name)
             return
 
         try:
@@ -632,49 +615,44 @@ class ESCLWalkupScanner:
             all_caps = await self.get_scanner_capabilities()
 
             duplex_requested = bool(shortcut_cfg.get("duplex", False))
-
             if input_source == "Feeder":
-                caps_key = (
-                    "FeederDuplex"
-                    if duplex_requested
-                    else "FeederSimplex"
-                )
-
+                caps_key = "FeederDuplex" if duplex_requested else "FeederSimplex"
                 if caps_key not in all_caps:
                     if duplex_requested:
                         raise ValueError(
-                            "Duplex was requested, but this printer does not "
-                            "advertise AdfDuplexInputCaps."
+                            "Duplex was requested, but this printer does not advertise "
+                            "AdfDuplexInputCaps. Disable duplex in this shortcut or use "
+                            "a duplex-capable ADF."
                         )
-
                     raise ValueError(
                         "The printer does not advertise AdfSimplexInputCaps."
                     )
-
                 source_caps = all_caps[caps_key]
-
             else:
                 if duplex_requested:
                     raise ValueError(
+                        "Duplex was requested, but no document is loaded in the ADF. "
                         "Duplex scanning cannot use the platen."
                     )
-
                 if "Platen" not in all_caps:
                     raise ValueError(
                         "The printer does not advertise PlatenInputCaps."
                     )
-
                 source_caps = all_caps["Platen"]
 
             scan_settings_xml, selected = self._build_scan_settings(
-                input_source,
-                shortcut_cfg,
-                source_caps,
+                input_source, shortcut_cfg, source_caps
             )
 
             effective_shortcut_cfg = dict(shortcut_cfg)
             effective_shortcut_cfg.update(selected)
             effective_shortcut_cfg["_input_source"] = input_source
+
+            if (
+                self.current_session_pages
+                and self.current_shortcut_cfg != effective_shortcut_cfg
+            ):
+                await self.finalize_session()
 
         except Exception as exc:
             logger.error(
@@ -695,21 +673,14 @@ class ESCLWalkupScanner:
         )
 
         jobs_url = f"{self.printer_url}/eSCL/ScanJobs"
-        headers = {
-            "Content-Type": "text/xml; charset=utf-8"
-        }
+        headers = {"Content-Type": "text/xml; charset=utf-8"}
 
         try:
             response = await self.client.post(
-                jobs_url,
-                content=scan_settings_xml,
-                headers=headers,
+                jobs_url, content=scan_settings_xml, headers=headers
             )
         except httpx.HTTPError as exc:
-            logger.error(
-                "Network error creating scan job: %s",
-                exc,
-            )
+            logger.error("Network error creating scan job: %s", exc)
             return
 
         if response.status_code != 201 or not response.headers.get("Location"):
@@ -720,24 +691,15 @@ class ESCLWalkupScanner:
             )
             return
 
-        job_url = self._resolve_location(
-            response.headers["Location"]
-        )
-
+        job_url = self._resolve_location(response.headers["Location"])
         next_document_url = f"{job_url.rstrip('/')}/NextDocument"
         page_num = 1
 
         while self.running:
             try:
-                document_response = await self.client.get(
-                    next_document_url
-                )
+                document_response = await self.client.get(next_document_url)
             except httpx.HTTPError as exc:
-                logger.error(
-                    "Network error fetching page %s: %s",
-                    page_num,
-                    exc,
-                )
+                logger.error("Network error fetching page %s: %s", page_num, exc)
                 break
 
             if document_response.status_code == 503:
@@ -750,7 +712,6 @@ class ESCLWalkupScanner:
                 try:
                     with Image.open(io.BytesIO(image_data)) as image:
                         image.verify()
-
                 except Exception as exc:
                     logger.error(
                         "Printer returned an invalid image for page %s: %s",
@@ -760,25 +721,19 @@ class ESCLWalkupScanner:
                     break
 
                 if not self.current_shortcut_cfg:
-                    self.current_shortcut_cfg = dict(
-                        effective_shortcut_cfg
-                    )
+                    self.current_shortcut_cfg = dict(effective_shortcut_cfg)
 
                 self.current_session_pages.append(image_data)
-
                 logger.info(
                     "Downloaded page %s (%s bytes).",
                     page_num,
                     len(image_data),
                 )
-
                 page_num += 1
                 continue
 
             if document_response.status_code == 404:
-                logger.info(
-                    "All pages for this ScanJob have been received."
-                )
+                logger.info("All pages for this ScanJob have been received.")
                 break
 
             logger.error(
@@ -809,8 +764,6 @@ class ESCLWalkupScanner:
             "output_dir": "/consume",
         }
 
-        # Detach the batch before writing so a later scan cannot accidentally
-        # append pages to the batch currently being saved.
         self.current_session_pages = []
         self.current_shortcut_cfg = None
 
@@ -854,8 +807,6 @@ class ESCLWalkupScanner:
                 filename = f"scan_{timestamp}_{uuid.uuid4().hex[:6]}{ext}"
                 target_path = output_dir / filename
 
-                # Write to a temporary file in the same directory, then atomically
-                # rename it so Paperless never sees a partially-written file.
                 with tempfile.NamedTemporaryFile(
                     mode="wb",
                     suffix=f"{ext}.tmp",
@@ -1023,7 +974,6 @@ async def main():
         try:
             loop.add_signal_handler(sig, stop_event.set)
         except NotImplementedError:
-            # add_signal_handler is not available on some event-loop platforms.
             pass
 
     run_task = asyncio.create_task(scanner.run())
