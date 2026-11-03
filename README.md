@@ -12,7 +12,7 @@ A lightweight Python service packaged in Docker that connects modern HP printers
 > 
 > By using this software, you acknowledge that you are using it entirely at your own discretion and risk.
 
-It listens for "Scan to Computer" events initiated directly from the printer's touchscreen panel using the **eSCL (AirScan / Mopria)** protocol over HTTPS, downloads scanned pages, and compiles them into PDFs saved directly to target directories.
+It listens for "Scan to Computer" events initiated directly from the printer's touchscreen panel using the **eSCL** protocol over HTTPS, downloads scanned pages, and compiles them into PDFs saved directly to target directories.
 
 ---
 
