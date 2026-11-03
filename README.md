@@ -2,6 +2,16 @@
 
 A lightweight Python service packaged in Docker that connects modern HP printers (e.g., HP OfficeJet Pro 8120e / 8122e series) to home servers and document management systems like **Paperless-ngx**.
 
+> ⚠️ **DISCLAIMER & WARNING**
+> 
+> **Use at your own risk.** This project is an unofficial, community-developed utility created **strictly for personal, experimental, and testing purposes**.
+> 
+> - **No Warranty:** This software is provided "as is", without warranty of any kind, express or implied.
+> - **No Liability:** The author(s) shall not be held liable for any claim, damages, hardware failure, data loss, network disruption, or any other liability arising from the installation, configuration, or use of this application.
+> - **Not Affiliated with HP:** This tool is not affiliated with, endorsed by, or supported by HP (Hewlett-Packard).
+> 
+> By using this software, you acknowledge that you are using it entirely at your own discretion and risk.
+
 It listens for "Scan to Computer" events initiated directly from the printer's touchscreen panel using the **eSCL (AirScan / Mopria)** protocol over HTTPS, downloads scanned pages, and compiles them into PDFs saved directly to target directories.
 
 ---
