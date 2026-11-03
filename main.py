@@ -617,11 +617,14 @@ class ESCLWalkupScanner:
             "duplex": duplex,
         }
 
-    async def handle_scan_request(self, shortcut_name: str):
+        async def handle_scan_request(self, shortcut_name: str):
         shortcut_cfg = self._get_shortcut_config(shortcut_name)
 
         if not isinstance(shortcut_cfg, dict):
-            logger.error("Shortcut '%s' configuration must be an object.", shortcut_name)
+            logger.error(
+                "Shortcut '%s' configuration must be an object.",
+                shortcut_name,
+            )
             return
 
         try:
@@ -629,45 +632,49 @@ class ESCLWalkupScanner:
             all_caps = await self.get_scanner_capabilities()
 
             duplex_requested = bool(shortcut_cfg.get("duplex", False))
+
             if input_source == "Feeder":
-                caps_key = "FeederDuplex" if duplex_requested else "FeederSimplex"
+                caps_key = (
+                    "FeederDuplex"
+                    if duplex_requested
+                    else "FeederSimplex"
+                )
+
                 if caps_key not in all_caps:
                     if duplex_requested:
                         raise ValueError(
-                            "Duplex was requested, but this printer does not advertise "
-                            "AdfDuplexInputCaps. Disable duplex in this shortcut or use "
-                            "a duplex-capable ADF."
+                            "Duplex was requested, but this printer does not "
+                            "advertise AdfDuplexInputCaps."
                         )
+
                     raise ValueError(
                         "The printer does not advertise AdfSimplexInputCaps."
                     )
+
                 source_caps = all_caps[caps_key]
+
             else:
                 if duplex_requested:
                     raise ValueError(
-                        "Duplex was requested, but no document is loaded in the ADF. "
                         "Duplex scanning cannot use the platen."
                     )
+
                 if "Platen" not in all_caps:
                     raise ValueError(
                         "The printer does not advertise PlatenInputCaps."
                     )
+
                 source_caps = all_caps["Platen"]
 
             scan_settings_xml, selected = self._build_scan_settings(
-                input_source, shortcut_cfg, source_caps
+                input_source,
+                shortcut_cfg,
+                source_caps,
             )
 
             effective_shortcut_cfg = dict(shortcut_cfg)
             effective_shortcut_cfg.update(selected)
             effective_shortcut_cfg["_input_source"] = input_source
-
-            # Compare resolved settings, not just the shortcut name/config.
-            if (
-                self.current_session_pages
-                and self.current_shortcut_cfg != effective_shortcut_cfg
-            ):
-                await self.finalize_session()
 
         except Exception as exc:
             logger.error(
@@ -688,14 +695,21 @@ class ESCLWalkupScanner:
         )
 
         jobs_url = f"{self.printer_url}/eSCL/ScanJobs"
-        headers = {"Content-Type": "text/xml; charset=utf-8"}
+        headers = {
+            "Content-Type": "text/xml; charset=utf-8"
+        }
 
         try:
             response = await self.client.post(
-                jobs_url, content=scan_settings_xml, headers=headers
+                jobs_url,
+                content=scan_settings_xml,
+                headers=headers,
             )
         except httpx.HTTPError as exc:
-            logger.error("Network error creating scan job: %s", exc)
+            logger.error(
+                "Network error creating scan job: %s",
+                exc,
+            )
             return
 
         if response.status_code != 201 or not response.headers.get("Location"):
@@ -706,74 +720,73 @@ class ESCLWalkupScanner:
             )
             return
 
-        job_url = self._resolve_location(response.headers["Location"])
+        job_url = self._resolve_location(
+            response.headers["Location"]
+        )
+
         next_document_url = f"{job_url.rstrip('/')}/NextDocument"
         page_num = 1
 
-        try:
-            while self.running:
-                try:
-                    document_response = await self.client.get(next_document_url)
-                except httpx.HTTPError as exc:
-                    logger.error("Network error fetching page %s: %s", page_num, exc)
-                    break
-
-                if document_response.status_code == 503:
-                    # eSCL uses 503 while the next page is not ready.
-                    # Keep waiting: high-resolution scans can take a long time.
-                    await asyncio.sleep(1)
-                    continue
-
-                if document_response.status_code == 200:
-                    image_data = document_response.content
-
-                    # Reject invalid/incomplete image payloads before adding them
-                    # to the current PDF batch.
-                    try:
-                        with Image.open(io.BytesIO(image_data)) as image:
-                            image.verify()
-                    except Exception as exc:
-                        logger.error(
-                            "Printer returned an invalid image for page %s: %s",
-                            page_num,
-                            exc,
-                        )
-                        break
-
-                    if not self.current_shortcut_cfg:
-                        self.current_shortcut_cfg = dict(effective_shortcut_cfg)
-
-                    self.current_session_pages.append(image_data)
-                    logger.info(
-                        "Downloaded page %s (%s bytes).",
-                        page_num,
-                        len(image_data),
-                    )
-                    page_num += 1
-                    continue
-
-                if document_response.status_code == 404:
-                    logger.info("All pages for this ScanJob have been received.")
-                    break
-
+        while self.running:
+            try:
+                document_response = await self.client.get(
+                    next_document_url
+                )
+            except httpx.HTTPError as exc:
                 logger.error(
-                    "Unexpected NextDocument response: HTTP %s\n%s",
-                    document_response.status_code,
-                    document_response.text[:500],
+                    "Network error fetching page %s: %s",
+                    page_num,
+                    exc,
                 )
                 break
 
-        finally:
-            # Release the printer's scan job after the document stream ends.
-            try:
-                delete_response = await self.client.delete(job_url)
-                if delete_response.status_code not in (200, 202, 204, 404, 410):
-                    logger.warning(
-                        "ScanJob cleanup returned HTTP %s.",
-                        delete_response.status_code,
+            if document_response.status_code == 503:
+                await asyncio.sleep(1)
+                continue
+
+            if document_response.status_code == 200:
+                image_data = document_response.content
+
+                try:
+                    with Image.open(io.BytesIO(image_data)) as image:
+                        image.verify()
+
+                except Exception as exc:
+                    logger.error(
+                        "Printer returned an invalid image for page %s: %s",
+                        page_num,
+                        exc,
                     )
-            except httpx.HTTPError as exc:
-                logger.warning("Could not delete ScanJob: %s", exc)
+                    break
+
+                if not self.current_shortcut_cfg:
+                    self.current_shortcut_cfg = dict(
+                        effective_shortcut_cfg
+                    )
+
+                self.current_session_pages.append(image_data)
+
+                logger.info(
+                    "Downloaded page %s (%s bytes).",
+                    page_num,
+                    len(image_data),
+                )
+
+                page_num += 1
+                continue
+
+            if document_response.status_code == 404:
+                logger.info(
+                    "All pages for this ScanJob have been received."
+                )
+                break
+
+            logger.error(
+                "Unexpected NextDocument response: HTTP %s\n%s",
+                document_response.status_code,
+                document_response.text[:500],
+            )
+            break
 
         logger.info(
             "Total pages collected in active session: %s",
