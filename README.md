@@ -54,6 +54,7 @@ Create `config.json` in your project root directory (or use `config.example.json
     "paperless": {
       "duplex": false,
       "paper_size": "A4",
+      "format": "pdf",
       "resolution": 300,
       "color_mode": "RGB24",
       "output_dir": "/consume"
@@ -61,6 +62,7 @@ Create `config.json` in your project root directory (or use `config.example.json
     "paperless duplex": {
       "duplex": false,
       "paper_size": "A4",
+      "format": "pdf",
       "resolution": 300,
       "color_mode": "RGB24",
       "output_dir": "/consume/double-sided"
@@ -68,6 +70,7 @@ Create `config.json` in your project root directory (or use `config.example.json
     "small documents": {
       "duplex": false,
       "paper_size": "A5",
+      "format": "pdf",
       "resolution": 300,
       "color_mode": "Grayscale8",
       "output_dir": "/consume"
@@ -75,9 +78,10 @@ Create `config.json` in your project root directory (or use `config.example.json
     "photos": {
       "duplex": false,
       "paper_size": "A6",
+      "format": "jpg",
       "resolution": 600,
       "color_mode": "RGB24",
-      "output_dir": "/consume/photos"
+      "output_dir": "/nextcloud/photos"
     }
   }
 }
@@ -102,6 +106,7 @@ Create `config.json` in your project root directory (or use `config.example.json
 | `paper_size` | String | See supported sizes below | Paper size for this shortcut. Overrides the global `paper_size`. |
 | `resolution` | Integer | Device-dependent | Requested scan resolution in DPI. The service selects a supported value if the requested resolution is unavailable. |
 | `color_mode` | String | Device-dependent | Requested color mode, such as `RGB24`, `Grayscale8`, or `BlackAndWhite1`. |
+| `format` | String | `pdf`, `jpg`, `jpeg`, `tiff`,`tif`, `png` | Output format for the scanned document. must be one of the supported formats. |
 | `output_dir` | String | - | Target container directory where generated PDFs are saved. |
 
 ### Supported Paper Sizes

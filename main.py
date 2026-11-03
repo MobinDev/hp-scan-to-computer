@@ -44,6 +44,22 @@ PAPER_SIZES = {
     "STATEMENT": (1650, 2550),
 }
 
+MIME_MAP = {
+    "application/pdf": ("PDF", ".pdf"),
+    "image/jpeg": ("JPEG", ".jpg"),
+    "image/png": ("PNG", ".png"),
+    "image/tiff": ("TIFF", ".tif"),
+}
+
+SHORTCUT_FORMAT_TO_MIME = {
+    "pdf": "application/pdf",
+    "jpeg": "image/jpeg",
+    "jpg": "image/jpeg",
+    "png": "image/png",
+    "tiff": "image/tiff",
+    "tif": "image/tiff",
+}
+
 
 def local_name(tag: str) -> str:
     """Return an XML tag name without its namespace."""
@@ -141,12 +157,17 @@ def parse_source_capabilities(
         resolutions.update(x for x in direct_x if x in direct_y)
 
     color_modes = descendants_text(caps_node, "ColorMode")
+    doc_formats = (
+        descendants_text(caps_node, "DocumentFormatExt")
+        or descendants_text(caps_node, "DocumentFormat")
+    )
 
     return {
         **limits,
         "resolutions": sorted(resolutions),
         "resolution_ranges": resolution_ranges,
         "color_modes": list(dict.fromkeys(color_modes)),
+        "doc_formats": list(dict.fromkeys(doc_formats)),
         "supports_duplex": supports_duplex,
     }
 
@@ -223,12 +244,12 @@ class ESCLWalkupScanner:
 
         for source, caps in capabilities.items():
             logger.info(
-                "%s capabilities: resolutions=%s, ranges=%s, color_modes=%s, "
+                "%s capabilities: resolutions=%s, color_modes=%s, doc_formats=%s, "
                 "width=%s..%s, height=%s..%s, duplex=%s",
                 source,
                 caps["resolutions"],
-                caps["resolution_ranges"],
                 caps["color_modes"],
+                caps["doc_formats"],
                 caps.get("MinWidth"),
                 caps.get("MaxWidth"),
                 caps.get("MinHeight"),
@@ -349,6 +370,29 @@ class ESCLWalkupScanner:
 
         return selected
 
+    @staticmethod
+    def _select_format(requested: str, caps: dict) -> tuple:
+        supported_mimes = caps.get("doc_formats", [])
+        requested_mime = SHORTCUT_FORMAT_TO_MIME.get(str(requested).lower(), str(requested))
+
+        if requested_mime in supported_mimes:
+            selected_mime = requested_mime
+        else:
+            if "application/pdf" in supported_mimes:
+                selected_mime = "application/pdf"
+            elif supported_mimes:
+                selected_mime = supported_mimes[0]
+            else:
+                selected_mime = "application/pdf"
+
+            logger.warning(
+                "Requested format '%s' (%s) is unsupported by scanner capabilities %s. Using '%s' instead.",
+                requested, requested_mime, supported_mimes, selected_mime,
+            )
+
+        pil_format, ext = MIME_MAP.get(selected_mime, ("PDF", ".pdf"))
+        return selected_mime, pil_format, ext
+
     def _resolve_location(self, location: str) -> str:
         """Resolve an absolute or relative Location header safely."""
         return urljoin(self.printer_url + "/", location)
@@ -397,7 +441,7 @@ class ESCLWalkupScanner:
                 return True
 
             logger.error(
-                "Failed to subscribe: HTTP %s - %s",
+                "Failed to subscribe: HTTP %s\n%s",
                 response.status_code,
                 response.text[:1000],
             )
@@ -471,6 +515,7 @@ class ESCLWalkupScanner:
             "duplex": False,
             "resolution": 300,
             "color_mode": "RGB24",
+            "format": "pdf",
             "output_dir": "/consume",
         }
 
@@ -497,6 +542,10 @@ class ESCLWalkupScanner:
         color_mode = self._select_color_mode(
             str(shortcut_cfg.get("color_mode", "RGB24")),
             caps,
+        )
+
+        escl_mime, pil_format, ext = self._select_format(
+            shortcut_cfg.get("format", "pdf"), caps
         )
 
         paper_size, paper_width, paper_height = (
@@ -538,7 +587,7 @@ class ESCLWalkupScanner:
             <ContentRegionUnits>escl:ThreeHundredthsOfInches</ContentRegionUnits>
         </ScanRegion>
     </ScanRegions>
-    <DocumentFormatExt>image/jpeg</DocumentFormatExt>
+    <DocumentFormatExt>{escl_mime}</DocumentFormatExt>
     <InputSource xmlns="{NS_PWG}">{input_source}</InputSource>
     <XResolution>{resolution}</XResolution>
     <YResolution>{resolution}</YResolution>
@@ -562,6 +611,9 @@ class ESCLWalkupScanner:
             "paper_height": paper_height,
             "resolution": resolution,
             "color_mode": color_mode,
+            "escl_mime": escl_mime,
+            "pil_format": pil_format,
+            "ext": ext,
             "duplex": duplex,
         }
 
@@ -648,7 +700,7 @@ class ESCLWalkupScanner:
 
         if response.status_code != 201 or not response.headers.get("Location"):
             logger.error(
-                "Failed to create scan job: HTTP %s - %s",
+                "Failed to create scan job: HTTP %s\n%s",
                 response.status_code,
                 response.text[:1000],
             )
@@ -705,7 +757,7 @@ class ESCLWalkupScanner:
                     break
 
                 logger.error(
-                    "Unexpected NextDocument response: HTTP %s - %s",
+                    "Unexpected NextDocument response: HTTP %s\n%s",
                     document_response.status_code,
                     document_response.text[:500],
                 )
@@ -758,6 +810,9 @@ class ESCLWalkupScanner:
         output_dir = Path(shortcut_cfg.get("output_dir", "/consume"))
         output_dir.mkdir(parents=True, exist_ok=True)
 
+        pil_format = shortcut_cfg.get("pil_format", "PDF")
+        ext = shortcut_cfg.get("ext", ".pdf")
+
         pil_images = []
         temp_path = None
 
@@ -766,7 +821,10 @@ class ESCLWalkupScanner:
                 try:
                     with Image.open(io.BytesIO(image_data)) as source_image:
                         source_image.load()
-                        pil_images.append(source_image.convert("RGB"))
+                        if pil_format == "JPEG" and source_image.mode not in ("L", "RGB"):
+                            pil_images.append(source_image.convert("RGB"))
+                        else:
+                            pil_images.append(source_image.copy())
                 except Exception as exc:
                     raise ValueError(
                         f"Could not decode scanned page {index}: {exc}"
@@ -777,43 +835,71 @@ class ESCLWalkupScanner:
                 return
 
             timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            filename = f"scan_{timestamp}_{uuid.uuid4().hex[:6]}.pdf"
-            target_path = output_dir / filename
-
-            # Write to a temporary file in the same directory, then atomically
-            # rename it so Paperless never sees a partially-written PDF.
-            with tempfile.NamedTemporaryFile(
-                mode="wb",
-                suffix=".pdf.tmp",
-                prefix=".scan_",
-                dir=output_dir,
-                delete=False,
-            ) as temp_file:
-                temp_path = Path(temp_file.name)
-
             resolution = int(shortcut_cfg.get("resolution", 300))
-            pil_images[0].save(
-                temp_path,
-                format="PDF",
-                save_all=True,
-                append_images=pil_images[1:],
-                resolution=resolution,
-            )
 
-            os.replace(temp_path, target_path)
-            temp_path = None
+            if pil_format in ("PDF", "TIFF"):
+                filename = f"scan_{timestamp}_{uuid.uuid4().hex[:6]}{ext}"
+                target_path = output_dir / filename
 
-            try:
-                os.chown(target_path, self.puid, self.pgid)
-                logger.info(
-                    "Set file ownership to UID: %s, GID: %s",
-                    self.puid,
-                    self.pgid,
+                # Write to a temporary file in the same directory, then atomically
+                # rename it so Paperless never sees a partially-written file.
+                with tempfile.NamedTemporaryFile(
+                    mode="wb",
+                    suffix=f"{ext}.tmp",
+                    prefix=".scan_",
+                    dir=output_dir,
+                    delete=False,
+                ) as temp_file:
+                    temp_path = Path(temp_file.name)
+
+                pil_images[0].save(
+                    temp_path,
+                    format=pil_format,
+                    save_all=True,
+                    append_images=pil_images[1:],
+                    resolution=resolution,
                 )
-            except (PermissionError, OSError) as exc:
-                logger.warning("Could not set file ownership: %s", exc)
 
-            logger.info("PDF saved successfully: %s", target_path)
+                os.replace(temp_path, target_path)
+                temp_path = None
+
+                try:
+                    os.chown(target_path, self.puid, self.pgid)
+                    logger.info(
+                        "Set file ownership to UID: %s, GID: %s",
+                        self.puid,
+                        self.pgid,
+                    )
+                except (PermissionError, OSError) as exc:
+                    logger.warning("Could not set file ownership: %s", exc)
+
+                logger.info("File saved successfully: %s", target_path)
+            else:
+                for idx, img in enumerate(pil_images, start=1):
+                    page_suffix = f"_p{idx}" if len(pil_images) > 1 else ""
+                    filename = f"scan_{timestamp}_{uuid.uuid4().hex[:6]}{page_suffix}{ext}"
+                    target_path = output_dir / filename
+
+                    with tempfile.NamedTemporaryFile(
+                        mode="wb",
+                        suffix=f"{ext}.tmp",
+                        prefix=".scan_",
+                        dir=output_dir,
+                        delete=False,
+                    ) as temp_file:
+                        temp_path = Path(temp_file.name)
+
+                    img.save(temp_path, format=pil_format, resolution=resolution)
+
+                    os.replace(temp_path, target_path)
+                    temp_path = None
+
+                    try:
+                        os.chown(target_path, self.puid, self.pgid)
+                    except (PermissionError, OSError) as exc:
+                        logger.warning("Could not set file ownership: %s", exc)
+
+                    logger.info("Page saved successfully: %s", target_path)
 
         finally:
             for image in pil_images:
