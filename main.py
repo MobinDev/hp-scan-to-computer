@@ -6,10 +6,17 @@ import logging
 import os
 import signal
 import sys
+import tempfile
+import uuid
 import xml.etree.ElementTree as ET
 from pathlib import Path
+from urllib.parse import urljoin, urlsplit, unquote
+from xml.sax.saxutils import escape
+
 import httpx
 from PIL import Image
+from pypdf import PdfReader, PdfWriter
+
 
 logging.basicConfig(
     level=logging.INFO,
@@ -21,282 +28,1144 @@ logger = logging.getLogger("escl-walkup")
 NS_ESCL = "http://schemas.hp.com/imaging/escl/2011/05/03"
 NS_PWG = "http://www.pwg.org/schemas/2010/12/sm"
 
+PAPER_SIZES = {
+    "A3": (3508, 4961),
+    "A4": (2480, 3508),
+    "A5": (1748, 2480),
+    "A6": (1240, 1748),
+    "A7": (874, 1240),
+    "B4": (2953, 4169),
+    "B5": (2079, 2953),
+    "B6": (1476, 2079),
+    "LETTER": (2550, 3300),
+    "LEGAL": (2550, 4200),
+    "EXECUTIVE": (2175, 3150),
+    "STATEMENT": (1650, 2550),
+}
+
+MIME_MAP = {
+    "application/pdf": ("PDF", ".pdf"),
+    "image/jpeg": ("JPEG", ".jpg"),
+    "image/png": ("PNG", ".png"),
+    "image/tiff": ("TIFF", ".tif"),
+}
+
+MIME_TO_FORMAT = {
+    "application/pdf": "pdf",
+    "image/jpeg": "jpeg",
+    "image/png": "png",
+    "image/tiff": "tiff",
+}
+
+SHORTCUT_FORMAT_TO_MIME = {
+    "pdf": "application/pdf",
+    "jpeg": "image/jpeg",
+    "jpg": "image/jpeg",
+    "png": "image/png",
+    "tiff": "image/tiff",
+    "tif": "image/tiff",
+}
+
+
+def local_name(tag: str) -> str:
+    """Return an XML tag name without its namespace."""
+    return tag.rsplit("}", 1)[-1]
+
+
+def find_text(root: ET.Element, wanted_name: str):
+    """Find the first element by local name, regardless of XML namespace."""
+    for element in root.iter():
+        if local_name(element.tag) == wanted_name:
+            return element.text.strip() if element.text else None
+    return None
+
+
+def find_int(root: ET.Element, wanted_name: str):
+    value = find_text(root, wanted_name)
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def descendants_text(root: ET.Element, wanted_name: str):
+    return [
+        element.text.strip()
+        for element in root.iter()
+        if local_name(element.tag) == wanted_name and element.text
+    ]
+
+
+def parse_source_capabilities(
+    root: ET.Element,
+    caps_name: str,
+    *,
+    supports_duplex: bool = False,
+):
+    """Parse capabilities for one physical input source, if advertised."""
+    caps_node = next(
+        (node for node in root.iter() if local_name(node.tag) == caps_name),
+        None,
+    )
+
+    if caps_node is None:
+        return None
+
+    limits = {}
+    limit_names = (
+        "MinWidth", "MaxWidth", "MinHeight", "MaxHeight",
+        "MinPageWidth", "MaxPageWidth",
+        "MinPageHeight", "MaxPageHeight",
+        "MaxScanRegions",
+    )
+    for name in limit_names:
+        value = find_int(caps_node, name)
+        if value is not None:
+            limits[name] = value
+
+    resolutions = set()
+    resolution_ranges = []
+
+    for node in caps_node.iter():
+        node_type = local_name(node.tag)
+        if node_type in ("DiscreteResolution", "Resolution"):
+            x = find_int(node, "XResolution")
+            y = find_int(node, "YResolution")
+            if x and y and x == y:
+                resolutions.add(x)
+
+        elif node_type == "ResolutionRange":
+            min_x = find_int(node, "MinXResolution")
+            max_x = find_int(node, "MaxXResolution")
+            min_y = find_int(node, "MinYResolution")
+            max_y = find_int(node, "MaxYResolution")
+
+            if None not in (min_x, max_x, min_y, max_y):
+                lower = max(min_x, min_y)
+                upper = min(max_x, max_y)
+                if lower <= upper:
+                    resolution_ranges.append({"min": lower, "max": upper})
+
+    if not resolutions and not resolution_ranges:
+        direct_x = [
+            int(value) for value in descendants_text(caps_node, "XResolution")
+            if value.isdigit()
+        ]
+        direct_y = [
+            int(value) for value in descendants_text(caps_node, "YResolution")
+            if value.isdigit()
+        ]
+        resolutions.update(x for x in direct_x if x in direct_y)
+
+    color_modes = descendants_text(caps_node, "ColorMode")
+    doc_formats = (
+        descendants_text(caps_node, "DocumentFormatExt")
+        or descendants_text(caps_node, "DocumentFormat")
+    )
+
+    return {
+        **limits,
+        "resolutions": sorted(resolutions),
+        "resolution_ranges": resolution_ranges,
+        "color_modes": list(dict.fromkeys(color_modes)),
+        "doc_formats": list(dict.fromkeys(doc_formats)),
+        "supports_duplex": supports_duplex,
+    }
+
 
 class ESCLWalkupScanner:
     def __init__(self, config_path: str = "config.json"):
-        with open(config_path, "r", encoding="utf-8") as f:
-            self.config = json.load(f)
+        with open(config_path, "r", encoding="utf-8") as config_file:
+            self.config = json.load(config_file)
 
         self.printer_url = self.config["printer_url"].rstrip("/")
         self.host_id = self.config.get("host_identifier", "Homelab-Scanner")
-        self.verify_ssl = self.config.get("verify_ssl", False)
+        self.verify_ssl = bool(self.config.get("verify_ssl", False))
         self.puid = int(self.config.get("puid", 1000))
         self.pgid = int(self.config.get("pgid", 1000))
         self.shortcuts = self.config.get("shortcuts", {})
 
+        if not isinstance(self.shortcuts, dict):
+            raise ValueError("'shortcuts' must be a JSON object.")
+
+        self.default_paper_size = str(
+            self.config.get("paper_size", "A4")
+        ).upper()
+
+        if self.default_paper_size not in PAPER_SIZES:
+            raise ValueError(
+                f"Unsupported paper_size '{self.default_paper_size}'. "
+                f"Choose one of: {', '.join(PAPER_SIZES)}."
+            )
+
+        self.capabilities_cache = None
+
         self.client = httpx.AsyncClient(
             verify=self.verify_ssl,
             timeout=httpx.Timeout(120.0, connect=10.0),
+            follow_redirects=True,
         )
+
         self.subscription_url = None
         self.subscription_id = None
         self.running = True
 
-        self.current_session_pages = []
+        self.current_session_documents = []
         self.current_shortcut_cfg = None
+
+    async def get_scanner_capabilities(self) -> dict:
+        if self.capabilities_cache is not None:
+            return self.capabilities_cache
+
+        url = f"{self.printer_url}/eSCL/ScannerCapabilities"
+        response = await self.client.get(url)
+        response.raise_for_status()
+        root = ET.fromstring(response.content)
+
+        capability_blocks = {
+            "Platen": ("PlatenInputCaps", False),
+            "FeederSimplex": ("AdfSimplexInputCaps", False),
+            "FeederDuplex": ("AdfDuplexInputCaps", True),
+        }
+
+        capabilities = {}
+        for source, (xml_name, is_duplex) in capability_blocks.items():
+            parsed = parse_source_capabilities(
+                root, xml_name, supports_duplex=is_duplex
+            )
+            if parsed is not None:
+                capabilities[source] = parsed
+
+        if not capabilities:
+            raise RuntimeError(
+                "ScannerCapabilities did not advertise any supported input source."
+            )
+
+        self.capabilities_cache = capabilities
+
+        for source, caps in capabilities.items():
+            logger.info(
+                "%s capabilities: resolutions=%s, color_modes=%s, doc_formats=%s, "
+                "width=%s..%s, height=%s..%s, duplex=%s",
+                source,
+                caps["resolutions"],
+                caps["color_modes"],
+                caps["doc_formats"],
+                caps.get("MinWidth"),
+                caps.get("MaxWidth"),
+                caps.get("MinHeight"),
+                caps.get("MaxHeight"),
+                caps["supports_duplex"],
+            )
+
+        return capabilities
+
+    def _select_paper_size(
+        self,
+        shortcut_cfg: dict,
+        input_source: str,
+        caps: dict,
+    ):
+        paper_size = str(
+            shortcut_cfg.get("paper_size", self.default_paper_size)
+        ).upper()
+
+        if paper_size not in PAPER_SIZES:
+            raise ValueError(
+                f"Unknown paper_size '{paper_size}'. "
+                f"Supported: {', '.join(PAPER_SIZES)}"
+            )
+
+        width, height = PAPER_SIZES[paper_size]
+
+        min_width = caps.get("MinWidth", 0)
+        min_height = caps.get("MinHeight", 0)
+        max_width = caps.get("MaxWidth")
+        max_height = caps.get("MaxHeight")
+
+        min_page_width = caps.get("MinPageWidth", 0)
+        min_page_height = caps.get("MinPageHeight", 0)
+        max_page_width = caps.get("MaxPageWidth") or None
+        max_page_height = caps.get("MaxPageHeight") or None
+
+        valid = (
+            width >= min_width
+            and height >= min_height
+            and (max_width is None or width <= max_width)
+            and (max_height is None or height <= max_height)
+            and width >= min_page_width
+            and height >= min_page_height
+            and (max_page_width is None or width <= max_page_width)
+            and (max_page_height is None or height <= max_page_height)
+        )
+
+        if not valid:
+            raise ValueError(
+                f"{paper_size} is outside the capabilities of {input_source}. "
+                f"ScanRegion width: {min_width}..{max_width or 'unbounded'}, "
+                f"height: {min_height}..{max_height or 'unbounded'}; "
+                f"page width: {min_page_width}..{max_page_width or 'unbounded'}, "
+                f"height: {min_page_height}..{max_page_height or 'unbounded'}."
+            )
+
+        return paper_size, width, height
+
+    @staticmethod
+    def _select_resolution(requested: int, caps: dict) -> int:
+        supported = caps.get("resolutions", [])
+        ranges = caps.get("resolution_ranges", [])
+
+        if requested in supported:
+            return requested
+
+        candidates = list(supported)
+        for item in ranges:
+            lower = item["min"]
+            upper = item["max"]
+            candidates.append(min(max(requested, lower), upper))
+
+        if not candidates:
+            raise ValueError(
+                "Scanner did not advertise supported resolutions or resolution ranges."
+            )
+
+        lower_or_equal = [value for value in candidates if value <= requested]
+        selected = max(lower_or_equal) if lower_or_equal else min(candidates)
+
+        logger.warning(
+            "Requested resolution %s is unsupported. Using %s instead. "
+            "Discrete values: %s; ranges: %s",
+            requested, selected, supported, ranges,
+        )
+        return selected
+
+    @staticmethod
+    def _select_color_mode(requested: str, caps: dict) -> str:
+        supported = caps.get("color_modes", [])
+
+        if not supported:
+            raise ValueError(
+                "Scanner did not advertise supported color modes."
+            )
+
+        if requested in supported:
+            return requested
+
+        selected = (
+            "RGB24"
+            if requested == "RGB24" and "RGB24" in supported
+            else supported[0]
+        )
+
+        logger.warning(
+            "Color mode %s is unsupported. Using %s instead. "
+            "Supported: %s",
+            requested,
+            selected,
+            supported,
+        )
+
+        return selected
+
+    @staticmethod
+    def _select_format(requested: str, caps: dict) -> tuple:
+        supported_mimes = caps.get("doc_formats", [])
+        requested_mime = SHORTCUT_FORMAT_TO_MIME.get(str(requested).lower(), str(requested))
+
+        if requested_mime in supported_mimes:
+            selected_mime = requested_mime
+        else:
+            if "application/pdf" in supported_mimes:
+                selected_mime = "application/pdf"
+            elif supported_mimes:
+                selected_mime = supported_mimes[0]
+            else:
+                selected_mime = "application/pdf"
+
+            logger.warning(
+                "Requested format '%s' (%s) is unsupported by scanner capabilities %s. Using '%s' instead.",
+                requested, requested_mime, supported_mimes, selected_mime,
+            )
+
+        pil_format, ext = MIME_MAP.get(selected_mime, ("PDF", ".pdf"))
+        return selected_mime, pil_format, ext
+
+    def _resolve_location(self, location: str) -> str:
+        """Resolve an absolute or relative Location header safely."""
+        return urljoin(self.printer_url + "/", location)
 
     async def register_subscription(self) -> bool:
         url = f"{self.printer_url}/eSCL/WalkupSubscriptions"
+
         shortcuts_xml = "".join(
-            f"<Shortcut>{name}</Shortcut>" for name in self.shortcuts.keys()
+            f"<Shortcut>{escape(str(name))}</Shortcut>"
+            for name in self.shortcuts
         )
+
         body = f"""<?xml version="1.0" encoding="UTF-8"?>
 <WalkupScanSubscription xmlns="{NS_ESCL}">
-	<HostIdentifier>{self.host_id}</HostIdentifier>
-	<Connection>Network</Connection>
-	<Shortcuts>
-		{shortcuts_xml}
-	</Shortcuts>
+    <HostIdentifier>{escape(str(self.host_id))}</HostIdentifier>
+    <Connection>Network</Connection>
+    <Shortcuts>
+        {shortcuts_xml}
+    </Shortcuts>
 </WalkupScanSubscription>"""
 
-        logger.info(f"Registering walkup subscription for '{self.host_id}'...")
-        headers = {"Content-Type": "text/xml", "Cache-Control": "no-cache"}
+        logger.info("Registering walkup subscription for '%s'...", self.host_id)
+        headers = {
+            "Content-Type": "text/xml; charset=utf-8",
+            "Cache-Control": "no-cache",
+        }
+
         try:
-            resp = await self.client.post(url, content=body, headers=headers)
-            if resp.status_code == 201 and "Location" in resp.headers:
-                loc = resp.headers["Location"]
-                self.subscription_url = loc if loc.startswith("http") else f"{self.printer_url}{loc}"
-                self.subscription_id = self.subscription_url.split("/")[-1]
-                logger.info(f"Successfully subscribed. Subscription ID: {self.subscription_id}")
+            response = await self.client.post(url, content=body, headers=headers)
+            if response.status_code == 201 and response.headers.get("Location"):
+                self.subscription_url = self._resolve_location(
+                    response.headers["Location"]
+                )
+                path = urlsplit(self.subscription_url).path.rstrip("/")
+                self.subscription_id = unquote(path.rsplit("/", 1)[-1])
+
+                if not self.subscription_id:
+                    logger.error("Printer returned an invalid subscription Location.")
+                    self.subscription_url = None
+                    return False
+
+                logger.info(
+                    "Successfully subscribed. Subscription ID: %s",
+                    self.subscription_id,
+                )
                 return True
-            else:
-                logger.error(f"Failed to subscribe: HTTP {resp.status_code} - {resp.text}")
-                return False
-        except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError) as e:
-            logger.warning(f"Printer offline or unreachable during subscription: {e}")
+
+            logger.error(
+                "Failed to subscribe: HTTP %s\n%s",
+                response.status_code,
+                response.text[:1000],
+            )
             return False
-        except Exception as e:
-            logger.error(f"Unexpected error during subscription: {e}")
+
+        except httpx.HTTPError as exc:
+            logger.warning("Printer offline or unreachable during subscription: %s", exc)
+            return False
+        except Exception:
+            logger.exception("Unexpected error during subscription")
             return False
 
     async def delete_subscription(self):
-        if self.subscription_url:
-            logger.info("Cleaning up subscription on printer...")
-            try:
-                await self.client.delete(self.subscription_url)
+        if not self.subscription_url:
+            return
+
+        logger.info("Cleaning up subscription on printer...")
+        try:
+            response = await self.client.delete(self.subscription_url)
+            if response.status_code not in (200, 202, 204, 404, 410):
+                logger.warning(
+                    "Subscription cleanup returned HTTP %s: %s",
+                    response.status_code,
+                    response.text[:500],
+                )
+            else:
                 logger.info("Subscription removed.")
-            except Exception as e:
-                logger.warning(f"Error removing subscription: {e}")
+        except httpx.HTTPError as exc:
+            logger.warning("Error removing subscription: %s", exc)
+        finally:
+            self.subscription_url = None
+            self.subscription_id = None
 
     async def check_scanner_status(self) -> str:
         url = f"{self.printer_url}/eSCL/ScannerStatus"
+
         try:
-            resp = await self.client.get(url)
-            if resp.status_code == 200:
-                root = ET.fromstring(resp.text)
-                adf_elem = root.find(f"{{{NS_ESCL}}}AdfState")
-                if adf_elem is not None and adf_elem.text == "ScannerAdfLoaded":
-                    return "Feeder"
-        except Exception as e:
-            logger.warning(f"Failed to fetch status: {e}")
+            response = await self.client.get(url)
+            response.raise_for_status()
+            root = ET.fromstring(response.content)
+        except (httpx.HTTPError, ET.ParseError) as exc:
+            raise RuntimeError(f"Could not read scanner status: {exc}") from exc
+
+        adf_state = find_text(root, "AdfState")
+        if adf_state == "ScannerAdfLoaded":
+            return "Feeder"
+
         return "Platen"
 
-    async def handle_scan_request(self, shortcut_name: str, settings_elem: ET.Element):
-        shortcut_cfg = self.shortcuts.get(shortcut_name)
-        if not shortcut_cfg:
-            for key, val in self.shortcuts.items():
-                if key.lower() in shortcut_name.lower():
-                    shortcut_cfg = val
-                    break
+    def _get_shortcut_config(self, shortcut_name: str) -> dict:
+        if shortcut_name in self.shortcuts:
+            return self.shortcuts[shortcut_name]
 
-        if not shortcut_cfg:
-            logger.warning(f"No config found for shortcut '{shortcut_name}'. Using default.")
-            shortcut_cfg = {
-                "duplex": False,
-                "resolution": 300,
-                "color_mode": "RGB24",
-                "output_dir": "/consume",
-            }
+        lowered_name = shortcut_name.casefold()
+        matches = [
+            (key, value)
+            for key, value in self.shortcuts.items()
+            if str(key).casefold() in lowered_name
+        ]
+        if matches:
+            return max(matches, key=lambda item: len(str(item[0])))[1]
 
-        input_source = await self.check_scanner_status()
-        res = shortcut_cfg.get("resolution", 300)
-        color_mode = shortcut_cfg.get("color_mode", "RGB24")
-        duplex = shortcut_cfg.get("duplex", False)
+        logger.warning(
+            "No config found for shortcut '%s'. Using default settings.",
+            shortcut_name,
+        )
+        return {
+            "duplex": False,
+            "resolution": 300,
+            "color_mode": "RGB24",
+            "format": "pdf",
+            "output_dir": "/consume",
+        }
 
-        if input_source == "Feeder":
-            height = 4200
-            duplex_str = "<Duplex>true</Duplex>" if duplex else "<Duplex>false</Duplex>"
-        else:
-            height = 3507
-            duplex_str = ""
+    def _build_scan_settings(
+        self,
+        input_source: str,
+        shortcut_cfg: dict,
+        caps: dict,
+    ):
+        requested_resolution = int(
+            shortcut_cfg.get("resolution", 300)
+        )
 
-        scan_settings_xml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<ScanSettings xmlns="{NS_ESCL}" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="{NS_ESCL} Scan Schema - 0.26.xsd">
-	<Version xmlns="{NS_PWG}">2.9</Version>
-	<ContextID>{self.subscription_id}</ContextID>
-	<Intent>Document</Intent>
-	<ScanRegions xmlns="{NS_PWG}" xmlns:n0="{NS_PWG}" n0:MustHonor="false">
-		<ScanRegion>
-			<Height>{height}</Height>
-			<Width>2550</Width>
-			<XOffset>0</XOffset>
-			<YOffset>0</YOffset>
-			<ContentRegionUnits>escl:ThreeHundredthsOfInches</ContentRegionUnits>
-		</ScanRegion>
-	</ScanRegions>
-	<DocumentFormatExt>image/jpeg</DocumentFormatExt>
-	<InputSource xmlns="{NS_PWG}">{input_source}</InputSource>
-	<XResolution>{res}</XResolution>
-	<YResolution>{res}</YResolution>
-	<ColorMode>{color_mode}</ColorMode>
-	{duplex_str}
-	<Brightness>4</Brightness>
-	<CompressionFactor>50</CompressionFactor>
-	<Contrast>4</Contrast>
-	<JobSourceInfo>
-		<UserName>LOCAL SERVICE</UserName>
-		<UserDomain></UserDomain>
-		<MachineName>{self.host_id}</MachineName>
-		<AppFileName>svchost.exe</AppFileName>
-		<Application>WIA client</Application>
-	</JobSourceInfo>
+        if requested_resolution <= 0:
+            raise ValueError(
+                "Scan resolution must be a positive integer."
+            )
+
+        resolution = self._select_resolution(
+            requested_resolution,
+            caps,
+        )
+
+        color_mode = self._select_color_mode(
+            str(shortcut_cfg.get("color_mode", "RGB24")),
+            caps,
+        )
+
+        escl_mime, pil_format, ext = self._select_format(
+            shortcut_cfg.get("format", "pdf"), caps
+        )
+
+        paper_size, paper_width, paper_height = (
+            self._select_paper_size(
+                shortcut_cfg,
+                input_source,
+                caps,
+            )
+        )
+
+        duplex = bool(shortcut_cfg.get("duplex", False))
+
+        if duplex and input_source != "Feeder":
+            raise ValueError("Duplex scanning is available only through the ADF.")
+        if duplex and not caps.get("supports_duplex", False):
+            raise ValueError(
+                "Duplex was requested, but ScannerCapabilities does not advertise "
+                "AdfDuplexInputCaps for this printer."
+            )
+
+        duplex_xml = (
+            f"<Duplex>{'true' if duplex else 'false'}</Duplex>"
+            if input_source == "Feeder"
+            else ""
+        )
+
+        xml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<ScanSettings xmlns="{NS_ESCL}"
+            xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
+    <Version xmlns="{NS_PWG}">2.9</Version>
+    <ContextID>{escape(str(self.subscription_id or ""))}</ContextID>
+    <ScanRegions xmlns="{NS_PWG}" xmlns:n0="{NS_PWG}" n0:MustHonor="false">
+        <ScanRegion>
+            <Height>{paper_height}</Height>
+            <Width>{paper_width}</Width>
+            <XOffset>0</XOffset>
+            <YOffset>0</YOffset>
+            <ContentRegionUnits>escl:ThreeHundredthsOfInches</ContentRegionUnits>
+        </ScanRegion>
+    </ScanRegions>
+    <DocumentFormatExt>{escl_mime}</DocumentFormatExt>
+    <InputSource xmlns="{NS_PWG}">{input_source}</InputSource>
+    <XResolution>{resolution}</XResolution>
+    <YResolution>{resolution}</YResolution>
+    <ColorMode>{escape(color_mode)}</ColorMode>
+    {duplex_xml}
+    <Brightness>4</Brightness>
+    <CompressionFactor>50</CompressionFactor>
+    <Contrast>4</Contrast>
+    <JobSourceInfo>
+        <UserName>LOCAL SERVICE</UserName>
+        <UserDomain></UserDomain>
+        <MachineName>{escape(str(self.host_id))}</MachineName>
+        <AppFileName>svchost.exe</AppFileName>
+        <Application>WIA client</Application>
+    </JobSourceInfo>
 </ScanSettings>"""
 
-        logger.info(f"Submitting ScanJob ({shortcut_name}, Source: {input_source}, Duplex: {duplex}, Height: {height})...")
-        jobs_url = f"{self.printer_url}/eSCL/ScanJobs"
-        headers = {"Content-Type": "text/xml"}
+        return xml, {
+            "paper_size": paper_size,
+            "paper_width": paper_width,
+            "paper_height": paper_height,
+            "resolution": resolution,
+            "color_mode": color_mode,
+            "escl_mime": escl_mime,
+            "pil_format": pil_format,
+            "ext": ext,
+            "duplex": duplex,
+        }
+
+    async def handle_scan_request(self, shortcut_name: str):
+        shortcut_cfg = self._get_shortcut_config(shortcut_name)
+
+        if not isinstance(shortcut_cfg, dict):
+            logger.error("Shortcut '%s' configuration must be an object.", shortcut_name)
+            return
+
         try:
-            resp = await self.client.post(jobs_url, content=scan_settings_xml, headers=headers)
-        except Exception as e:
-            logger.error(f"Network error creating scan job: {e}")
+            input_source = await self.check_scanner_status()
+            all_caps = await self.get_scanner_capabilities()
+
+            duplex_requested = bool(shortcut_cfg.get("duplex", False))
+            if input_source == "Feeder":
+                caps_key = "FeederDuplex" if duplex_requested else "FeederSimplex"
+                if caps_key not in all_caps:
+                    if duplex_requested:
+                        raise ValueError(
+                            "Duplex was requested, but this printer does not advertise "
+                            "AdfDuplexInputCaps. Disable duplex in this shortcut or use "
+                            "a duplex-capable ADF."
+                        )
+                    raise ValueError(
+                        "The printer does not advertise AdfSimplexInputCaps."
+                    )
+                source_caps = all_caps[caps_key]
+            else:
+                if duplex_requested:
+                    raise ValueError(
+                        "Duplex was requested, but no document is loaded in the ADF. "
+                        "Duplex scanning cannot use the platen."
+                    )
+                if "Platen" not in all_caps:
+                    raise ValueError(
+                        "The printer does not advertise PlatenInputCaps."
+                    )
+                source_caps = all_caps["Platen"]
+
+            scan_settings_xml, selected = self._build_scan_settings(
+                input_source, shortcut_cfg, source_caps
+            )
+
+            effective_shortcut_cfg = dict(shortcut_cfg)
+            effective_shortcut_cfg.update(selected)
+            effective_shortcut_cfg["_input_source"] = input_source
+
+            if (
+                self.current_session_documents
+                and self.current_shortcut_cfg != effective_shortcut_cfg
+            ):
+                await self.finalize_session()
+
+        except Exception as exc:
+            logger.error(
+                "Cannot prepare scan request '%s': %s",
+                shortcut_name,
+                exc,
+            )
             return
 
-        if resp.status_code != 201 or "Location" not in resp.headers:
-            logger.error(f"Failed to create scan job: HTTP {resp.status_code} - {resp.text}")
+        logger.info(
+            "Submitting ScanJob (%s, Source: %s, Paper: %s, "
+            "Resolution: %s dpi, Color: %s)",
+            shortcut_name,
+            input_source,
+            selected["paper_size"],
+            selected["resolution"],
+            selected["color_mode"],
+        )
+
+        jobs_url = f"{self.printer_url}/eSCL/ScanJobs"
+        headers = {"Content-Type": "text/xml; charset=utf-8"}
+
+        try:
+            response = await self.client.post(
+                jobs_url, content=scan_settings_xml, headers=headers
+            )
+        except httpx.HTTPError as exc:
+            logger.error("Network error creating scan job: %s", exc)
             return
 
-        job_location = resp.headers["Location"]
-        job_url = job_location if job_location.startswith("http") else f"{self.printer_url}{job_location}"
-        
+        if response.status_code != 201 or not response.headers.get("Location"):
+            logger.error(
+                "Failed to create scan job: HTTP %s\n%s",
+                response.status_code,
+                response.text[:1000],
+            )
+            return
+
+        job_url = self._resolve_location(response.headers["Location"])
+        next_document_url = f"{job_url.rstrip('/')}/NextDocument"
         page_num = 1
-        next_doc_url = f"{job_url}/NextDocument"
 
-        while True:
+        while self.running:
             try:
-                doc_resp = await self.client.get(next_doc_url)
-                if doc_resp.status_code == 503:
-                    await asyncio.sleep(1)
-                    continue
-                elif doc_resp.status_code == 200:
-                    logger.info(f"Downloaded page {page_num} ({len(doc_resp.content)} bytes).")
-                    self.current_session_pages.append(doc_resp.content)
-                    if not self.current_shortcut_cfg:
-                        self.current_shortcut_cfg = shortcut_cfg
-                    page_num += 1
-                elif doc_resp.status_code == 404:
-                    logger.info("Current job pages received.")
-                    break
-                else:
-                    logger.error(f"Unexpected document fetch status: HTTP {doc_resp.status_code}")
-                    break
-            except Exception as e:
-                logger.error(f"Error fetching page {page_num}: {e}")
+                document_response = await self.client.get(next_document_url)
+            except httpx.HTTPError as exc:
+                logger.error("Network error fetching page %s: %s", page_num, exc)
                 break
 
-        logger.info(f"Total pages collected in active session so far: {len(self.current_session_pages)}")
+            if document_response.status_code == 503:
+                await asyncio.sleep(1)
+                continue
 
-    async def finalize_session(self):
-        if self.current_session_pages:
-            logger.info(f"Finalizing session. Generating PDF for {len(self.current_session_pages)} page(s)...")
-            cfg = self.current_shortcut_cfg or {
-                "duplex": False,
-                "resolution": 300,
-                "color_mode": "RGB24",
-                "output_dir": "/consume",
-            }
-            await self.save_pdf(self.current_session_pages, cfg)
-            self.current_session_pages = []
-            self.current_shortcut_cfg = None
+            if document_response.status_code == 200:
+                document_data = document_response.content
+                content_type = document_response.headers.get("Content-Type", "unknown")
+                content_location = document_response.headers.get("Content-Location", "")
 
-    async def save_pdf(self, image_buffers: list[bytes], shortcut_cfg: dict):
+                try:
+                    actual_format = self._detect_document_format(
+                        document_data,
+                        content_type,
+                    )
+                    if actual_format == "pdf":
+                        document_pages = self._pdf_page_count(document_data)
+                    else:
+                        document_pages = self._image_page_count(document_data)
+                except Exception as exc:
+                    logger.error(
+                        "Printer returned unreadable data for NextDocument #%s: %s. "
+                        "Content-Type=%s, bytes=%s, first_32_bytes=%s, preview=%r",
+                        page_num,
+                        exc,
+                        content_type,
+                        len(document_data),
+                        document_data[:32].hex(" "),
+                        document_data[:120],
+                    )
+                    break
+
+                requested_mime = selected["escl_mime"]
+                expected_format = MIME_TO_FORMAT.get(requested_mime)
+                if expected_format and actual_format != expected_format:
+                    logger.warning(
+                        "Printer returned %s although %s was requested. "
+                        "Processing the actual response format.",
+                        actual_format.upper(),
+                        requested_mime,
+                    )
+
+                if not self.current_shortcut_cfg:
+                    self.current_shortcut_cfg = dict(effective_shortcut_cfg)
+
+                self.current_session_documents.append({
+                    "data": document_data,
+                    "format": actual_format,
+                    "content_type": content_type,
+                    "content_location": content_location,
+                    "pages": document_pages,
+                })
+                logger.info(
+                    "Downloaded NextDocument #%s: format=%s, Content-Type=%s, "
+                    "pages=%s, bytes=%s%s",
+                    page_num,
+                    actual_format,
+                    content_type,
+                    document_pages,
+                    len(document_data),
+                    f", Content-Location={content_location}" if content_location else "",
+                )
+                page_num += 1
+                continue
+
+            if document_response.status_code == 404:
+                logger.info("All pages for this ScanJob have been received.")
+                break
+
+            logger.error(
+                "Unexpected NextDocument response: HTTP %s\n%s",
+                document_response.status_code,
+                document_response.text[:500],
+            )
+            break
+
+        logger.info(
+            "Total response documents collected in active session: %s",
+            len(self.current_session_documents),
+        )
+
+    @staticmethod
+    def _detect_document_format(data: bytes, content_type: str) -> str:
+        """Detect the actual payload type from its bytes, not the requested format."""
+        if not data:
+            raise ValueError("NextDocument response body is empty.")
+
+        # PDF headers are normally at byte zero; allow a small leading offset as
+        # some generators put harmless bytes before the header.
+        if b"%PDF-" in data[:1024]:
+            return "pdf"
+
+        try:
+            with Image.open(io.BytesIO(data)) as image:
+                image_format = (image.format or "").upper()
+                image.verify()
+        except Exception as exc:
+            normalized_type = content_type.split(";", 1)[0].strip().lower()
+            raise ValueError(
+                f"Payload is neither a readable PDF nor a supported image "
+                f"(HTTP Content-Type={normalized_type or 'unknown'}): {exc}"
+            ) from exc
+
+        format_map = {
+            "JPEG": "jpeg",
+            "JPG": "jpeg",
+            "PNG": "png",
+            "TIFF": "tiff",
+        }
+        actual_format = format_map.get(image_format)
+        if not actual_format:
+            raise ValueError(
+                f"Unsupported image format {image_format or 'unknown'} "
+                f"(HTTP Content-Type={content_type})."
+            )
+        return actual_format
+
+    @staticmethod
+    def _pdf_page_count(data: bytes) -> int:
+        try:
+            reader = PdfReader(io.BytesIO(data), strict=False)
+            if reader.is_encrypted:
+                decrypt_result = reader.decrypt("")
+                if not decrypt_result:
+                    raise ValueError("PDF is encrypted and has no empty-password access.")
+            count = len(reader.pages)
+            if count < 1:
+                raise ValueError("PDF contains no pages.")
+            return count
+        except Exception as exc:
+            raise ValueError(f"Invalid PDF payload: {exc}") from exc
+
+    @staticmethod
+    def _image_page_count(data: bytes) -> int:
+        try:
+            with Image.open(io.BytesIO(data)) as image:
+                return int(getattr(image, "n_frames", 1))
+        except Exception as exc:
+            raise ValueError(f"Invalid image payload: {exc}") from exc
+
+    @staticmethod
+    def _load_image_frames(document: dict) -> list:
+        """Decode every frame/page from a raster response (e.g. multi-page TIFF)."""
+        images = []
+        try:
+            with Image.open(io.BytesIO(document["data"])) as source:
+                frame_count = int(getattr(source, "n_frames", 1))
+                for frame_index in range(frame_count):
+                    source.seek(frame_index)
+                    source.load()
+                    images.append(source.copy())
+        except Exception as exc:
+            for image in images:
+                image.close()
+            raise ValueError(
+                f"Could not decode {document.get('format', 'image')} response: {exc}"
+            ) from exc
+        return images
+
+    @staticmethod
+    def _prepare_pdf_image(image: Image.Image) -> Image.Image:
+        """Return an independent PDF-compatible L/RGB image."""
+        if image.mode in ("1", "L", "RGB"):
+            return image.copy()
+        return image.convert("RGB")
+
+    def _image_document_to_pdf(self, document: dict, resolution: int) -> tuple[bytes, int]:
+        images = self._load_image_frames(document)
+        pdf_images = []
+        try:
+            for image in images:
+                pdf_images.append(self._prepare_pdf_image(image))
+            if not pdf_images:
+                raise ValueError("Image response contains no frames.")
+
+            output = io.BytesIO()
+            pdf_images[0].save(
+                output,
+                format="PDF",
+                save_all=True,
+                append_images=pdf_images[1:],
+                resolution=int(resolution),
+            )
+            return output.getvalue(), len(pdf_images)
+        finally:
+            for image in images + pdf_images:
+                try:
+                    image.close()
+                except Exception:
+                    pass
+
+    def _documents_to_pdf(self, documents: list, resolution: int) -> tuple[bytes, int]:
+        """Create one PDF, preserving native PDF pages and converting raster pages."""
+        if len(documents) == 1 and documents[0]["format"] == "pdf":
+            data = documents[0]["data"]
+            return data, self._pdf_page_count(data)
+
+        writer = PdfWriter()
+        readers = []  # Keep readers alive until writer.write() completes.
+        total_pages = 0
+        try:
+            for document_index, document in enumerate(documents, start=1):
+                if document["format"] == "pdf":
+                    pdf_data = document["data"]
+                else:
+                    pdf_data, _ = self._image_document_to_pdf(document, resolution)
+
+                reader = PdfReader(io.BytesIO(pdf_data), strict=False)
+                if reader.is_encrypted:
+                    if not reader.decrypt(""):
+                        raise ValueError(
+                            f"PDF response {document_index} is encrypted and cannot be opened."
+                        )
+                readers.append(reader)
+                for page in reader.pages:
+                    writer.add_page(page)
+                    total_pages += 1
+
+            if total_pages < 1:
+                raise ValueError("No pages were available to write to the PDF.")
+
+            output = io.BytesIO()
+            writer.write(output)
+            return output.getvalue(), total_pages
+        finally:
+            writer.close()
+
+    def _atomic_write(self, output_dir: Path, filename: str, data: bytes) -> Path:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        target_path = output_dir / filename
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                suffix=".tmp",
+                prefix=".scan_",
+                dir=output_dir,
+                delete=False,
+            ) as temp_file:
+                temp_path = Path(temp_file.name)
+                temp_file.write(data)
+                temp_file.flush()
+                os.fsync(temp_file.fileno())
+
+            os.replace(temp_path, target_path)
+            temp_path = None
+
+            try:
+                os.chown(target_path, self.puid, self.pgid)
+            except (PermissionError, OSError) as exc:
+                logger.warning(
+                    "Could not set file ownership to UID:GID %s:%s: %s",
+                    self.puid,
+                    self.pgid,
+                    exc,
+                )
+            return target_path
+        finally:
+            if temp_path and temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    logger.warning("Could not remove temporary file: %s", temp_path)
+
+    def save_documents(self, documents: list, shortcut_cfg: dict):
+        """Save the collected eSCL documents in the configured output format."""
+        if not documents:
+            raise ValueError("No scan documents were collected.")
+
         output_dir = Path(shortcut_cfg.get("output_dir", "/consume"))
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        pil_images = []
-        for img_bytes in image_buffers:
-            img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-            pil_images.append(img)
+        pil_format = str(shortcut_cfg.get("pil_format", "PDF")).upper()
+        ext = shortcut_cfg.get("ext", ".pdf")
+        resolution = int(shortcut_cfg.get("resolution", 300))
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        file_id = uuid.uuid4().hex[:6]
+        formats = {document["format"] for document in documents}
 
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"scan_{timestamp}.pdf"
-        target_path = output_dir / filename
+        if pil_format == "PDF":
+            pdf_data, page_count = self._documents_to_pdf(documents, resolution)
+            filename = f"scan_{timestamp}_{file_id}{ext}"
+            target_path = self._atomic_write(output_dir, filename, pdf_data)
+            logger.info("PDF saved successfully: %s (%s page(s))", target_path, page_count)
+            return target_path, page_count
 
-        pil_images[0].save(target_path, save_all=True, append_images=pil_images[1:], format="PDF")
-        logger.info(f"PDF saved successfully: {target_path}")
+        if "pdf" in formats:
+            raise ValueError(
+                f"Printer returned PDF but shortcut requests {pil_format}; "
+                "automatic PDF-to-image conversion is not enabled. "
+                "Set this shortcut's format to 'pdf' to preserve the scan."
+            )
+
+        all_images = []
+        try:
+            for document in documents:
+                all_images.extend(self._load_image_frames(document))
+
+            if not all_images:
+                raise ValueError("No raster pages were available to save.")
+
+            if pil_format == "TIFF":
+                filename = f"scan_{timestamp}_{file_id}{ext}"
+                output = io.BytesIO()
+                all_images[0].save(
+                    output,
+                    format="TIFF",
+                    save_all=True,
+                    append_images=all_images[1:],
+                    resolution=resolution,
+                )
+                target_path = self._atomic_write(output_dir, filename, output.getvalue())
+                logger.info("TIFF saved successfully: %s (%s page(s))", target_path, len(all_images))
+                return target_path, len(all_images)
+
+            if pil_format not in ("JPEG", "PNG"):
+                raise ValueError(f"Unsupported output image format: {pil_format}")
+
+            saved_paths = []
+            for index, image in enumerate(all_images, start=1):
+                output_image = image
+                converted = None
+                try:
+                    if pil_format == "JPEG" and image.mode not in ("L", "RGB"):
+                        converted = image.convert("RGB")
+                        output_image = converted
+
+                    suffix = f"_p{index}" if len(all_images) > 1 else ""
+                    filename = f"scan_{timestamp}_{file_id}{suffix}{ext}"
+                    output = io.BytesIO()
+                    output_image.save(output, format=pil_format, resolution=resolution)
+                    target_path = self._atomic_write(output_dir, filename, output.getvalue())
+                    saved_paths.append(target_path)
+                    logger.info("Image saved successfully: %s", target_path)
+                finally:
+                    if converted is not None:
+                        converted.close()
+
+            return saved_paths[0], len(saved_paths)
+        finally:
+            for image in all_images:
+                try:
+                    image.close()
+                except Exception:
+                    pass
+
+    async def finalize_session(self):
+        if not self.current_session_documents:
+            self.current_shortcut_cfg = None
+            return
+
+        logger.info(
+            "Finalizing session. Processing %s response document(s)...",
+            len(self.current_session_documents),
+        )
+
+        documents = self.current_session_documents
+        cfg = self.current_shortcut_cfg or {
+            "resolution": 300,
+            "output_dir": "/consume",
+            "pil_format": "PDF",
+            "ext": ".pdf",
+        }
+
+        self.current_session_documents = []
+        self.current_shortcut_cfg = None
 
         try:
-            os.chown(target_path, self.puid, self.pgid)
-            logger.info(f"Set file permissions to UID: {self.puid}, GID: {self.pgid}")
-        except Exception as e:
-            logger.warning(f"Failed to set file permissions via chown: {e}")
+            output_path, page_count = await asyncio.to_thread(
+                self.save_documents, documents, cfg
+            )
+            logger.info("Scan output saved: %s (%s page(s))", output_path, page_count)
+        except Exception:
+            logger.exception("Failed to save the current scan session")
 
     async def poll_events(self):
+        if not self.subscription_url:
+            return
+
         event_url = f"{self.subscription_url}/Event?timeout=100"
+
         while self.running:
             try:
-                resp = await self.client.get(event_url, timeout=110.0)
-                if resp.status_code == 204:
-                    continue
-                elif resp.status_code == 200:
-                    root = ET.fromstring(resp.text)
-                    event_type_elem = root.find(f"{{{NS_ESCL}}}Event")
-                    event_type = event_type_elem.text if event_type_elem is not None else ""
+                response = await self.client.get(event_url, timeout=110.0)
 
+                if response.status_code == 204:
+                    continue
+
+                if response.status_code == 200:
+                    try:
+                        root = ET.fromstring(response.content)
+                    except ET.ParseError as exc:
+                        logger.warning("Ignoring malformed event XML: %s", exc)
+                        continue
+
+                    event_type = find_text(root, "Event") or ""
                     if event_type == "HostSelected":
                         logger.info("Host selected on printer panel.")
-                        if self.current_session_pages:
+                        if self.current_session_documents:
                             await self.finalize_session()
+
                     elif event_type == "ScanRequested":
-                        shortcut_elem = root.find(f"{{{NS_ESCL}}}Shortcut")
-                        shortcut_name = shortcut_elem.text if shortcut_elem is not None else "paperless"
-                        settings_elem = root.find(f"{{{NS_ESCL}}}ScanSettings")
-                        logger.info(f"Scan requested! Shortcut: '{shortcut_name}'")
-                        await self.handle_scan_request(shortcut_name, settings_elem)
+                        shortcut_name = find_text(root, "Shortcut") or "paperless"
+                        logger.info("Scan requested! Shortcut: '%s'", shortcut_name)
+                        await self.handle_scan_request(shortcut_name)
+
                     elif event_type == "ScanPagesComplete":
-                        logger.info("ScanPagesComplete event received. Finalizing batch PDF...")
+                        logger.info(
+                            "ScanPagesComplete event received. Finalizing batch PDF..."
+                        )
                         await self.finalize_session()
-                elif resp.status_code in (404, 410):
+
+                    else:
+                        logger.debug("Received eSCL event: %s", event_type)
+
+                    continue
+
+                if response.status_code in (404, 410):
                     logger.warning(
-                        f"Subscription expired or printer restarted (HTTP {resp.status_code}). "
-                        "Re-registering subscription..."
+                        "Subscription expired or printer restarted (HTTP %s). "
+                        "Re-registering subscription...",
+                        response.status_code,
                     )
                     break
-                else:
-                    logger.warning(f"Unexpected event response: HTTP {resp.status_code}")
-                    await asyncio.sleep(2)
+
+                logger.warning("Unexpected event response: HTTP %s", response.status_code)
+                await asyncio.sleep(2)
+
             except httpx.TimeoutException:
                 continue
-            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError) as e:
-                logger.warning(f"Printer offline or unreachable: {e}. Will retry subscription in 10s...")
+            except (httpx.ConnectError, httpx.ConnectTimeout, httpx.NetworkError) as exc:
+                logger.warning(
+                    "Printer offline or unreachable: %s. Will retry subscription in 10s...",
+                    exc,
+                )
                 await asyncio.sleep(10)
                 break
-            except Exception as e:
-                if self.running:
-                    logger.error(f"Error during long-poll: {e}")
-                    await asyncio.sleep(5)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("Error during long-poll")
+                await asyncio.sleep(5)
 
     async def run(self):
         while self.running:
             subscribed = await self.register_subscription()
+
             if subscribed:
                 await self.poll_events()
-            else:
-                if self.running:
-                    logger.warning("Subscription failed or printer offline. Retrying in 15 seconds...")
-                    await asyncio.sleep(15)
+            elif self.running:
+                logger.warning(
+                    "Subscription failed or printer offline. Retrying in 15 seconds..."
+                )
+                await asyncio.sleep(15)
 
     async def stop(self):
         self.running = False
+        await self.finalize_session()
         await self.delete_subscription()
         await self.client.aclose()
 
@@ -304,19 +1173,26 @@ class ESCLWalkupScanner:
 async def main():
     scanner = ESCLWalkupScanner("config.json")
     loop = asyncio.get_running_loop()
-
-    def shutdown():
-        logger.info("Shutdown signal received.")
-        asyncio.create_task(scanner.stop())
+    stop_event = asyncio.Event()
 
     for sig in (signal.SIGINT, signal.SIGTERM):
-        loop.add_signal_handler(sig, shutdown)
+        try:
+            loop.add_signal_handler(sig, stop_event.set)
+        except NotImplementedError:
+            pass
+
+    run_task = asyncio.create_task(scanner.run())
 
     try:
-        await scanner.run()
-    except asyncio.CancelledError:
-        pass
+        await stop_event.wait()
+    finally:
+        run_task.cancel()
+        await asyncio.gather(run_task, return_exceptions=True)
+        await scanner.stop()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass
