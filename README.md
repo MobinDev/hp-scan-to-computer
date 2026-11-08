@@ -201,10 +201,10 @@ For the HP OfficeJet Pro 8120e / 8122e series, the ADF is simplex-only. Therefor
 
 ```yaml
 services:
-  hpscan:
+  hp-scan-to-computer:
     build: .
-    image: hpscan:latest
-    container_name: hpscan
+    image: hp-scan-to-computer:latest
+    container_name: hp-scan-to-computer
     restart: unless-stopped
     environment:
       - TZ=Europe/Berlin
@@ -220,7 +220,7 @@ services:
 docker compose up -d --build
 
 # View real-time logs
-docker logs -f hpscan
+docker logs -f hp-scan-to-computer
 ```
 
 ---
