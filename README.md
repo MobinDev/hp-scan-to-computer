@@ -4,7 +4,35 @@ A lightweight Python service packaged in Docker that connects modern HP printers
 
 It listens for "Scan to Computer" events initiated directly from the printer's touchscreen panel using the **eSCL (AirScan / Mopria)** protocol over HTTPS, downloads scanned pages, and compiles them into PDFs saved directly to target directories.
 
+> ⚠️ **DISCLAIMER & WARNING**
+> 
+> **Use at your own risk.** This project is an unofficial, community-developed utility created **strictly for personal, experimental, and testing purposes**.
+> 
+> - **No Warranty:** This software is provided "as is", without warranty of any kind, express or implied.
+> - **No Liability:** The author(s) shall not be held liable for any claim, damages, hardware failure, data loss, network disruption, or any other liability arising from the installation, configuration, or use of this application.
+> - **Not Affiliated with HP:** This tool is not affiliated with, endorsed by, or supported by HP (Hewlett-Packard).
+> 
+> By using this software, you acknowledge that you are using it entirely at your own discretion and risk.
+
+
 ---
+
+## Table of Contents
+
+- [Features](#features)
+- [Project Structure](#project-structure)
+- [Configuration (`config.json`)](#configuration-configjson)
+  - [Global Parameters](#global-parameters)
+  - [Shortcut Parameters](#shortcut-parameters)
+  - [Supported Paper Sizes](#supported-paper-sizes)
+  - [Capability Detection](#capability-detection)
+  - [Important Notes](#important-notes)
+- [Deployment via Docker Compose](#deployment-via-docker-compose)
+  - [docker-compose.yml](#docker-composeyml)
+  - [Run Service](#run-service)
+- [How It Works](#how-it-works)
+- [Verified Hardware](#verified-hardware)
+- [License](#license)
 
 ## Features
 
@@ -28,11 +56,11 @@ It listens for "Scan to Computer" events initiated directly from the printer's t
 
 ```text
 .
-├── config.json           # Active configuration file
+├── config.example.json   # Example configuration file with scan shortcuts
 ├── main.py               # Main eSCL listener service
 ├── Dockerfile            # Container build instructions
 ├── docker-compose.yml    # Docker Compose / Portainer deployment
-├── requirements.txt      # Python dependencies (httpx, Pillow)
+├── requirements.txt      # Python dependencies
 └── .gitignore            # Git ignore rules
 ```
 
@@ -215,7 +243,7 @@ docker logs -f hpscan
 
 - **HP OfficeJet Pro 8120e Series (including 8122e)**
 
-The implementation is designed for other printers supporting the eSCL / AirScan protocol, provided they expose compatible Walkup Scan functionality.
+The implementation is designed for other new HP printers which supporting the eSCL / AirScan protocol, provided they expose compatible Walkup Scan functionality.
 
 ---
 
