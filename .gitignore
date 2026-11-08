@@ -54,4 +54,4 @@ flows/
 Thumbs.db
 
 # Optional: Ignore custom config if it contains private IPs or credentials
-# config.json
+config.json

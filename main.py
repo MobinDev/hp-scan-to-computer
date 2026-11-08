@@ -15,6 +15,7 @@ from xml.sax.saxutils import escape
 
 import httpx
 from PIL import Image
+from pypdf import PdfReader, PdfWriter
 
 
 logging.basicConfig(
@@ -47,6 +48,13 @@ MIME_MAP = {
     "image/jpeg": ("JPEG", ".jpg"),
     "image/png": ("PNG", ".png"),
     "image/tiff": ("TIFF", ".tif"),
+}
+
+MIME_TO_FORMAT = {
+    "application/pdf": "pdf",
+    "image/jpeg": "jpeg",
+    "image/png": "png",
+    "image/tiff": "tiff",
 }
 
 SHORTCUT_FORMAT_TO_MIME = {
@@ -202,7 +210,7 @@ class ESCLWalkupScanner:
         self.subscription_id = None
         self.running = True
 
-        self.current_session_pages = []
+        self.current_session_documents = []
         self.current_shortcut_cfg = None
 
     async def get_scanner_capabilities(self) -> dict:
@@ -560,7 +568,6 @@ class ESCLWalkupScanner:
 
         xml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <ScanSettings xmlns="{NS_ESCL}"
-            xmlns:escl="{NS_ESCL}"
             xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance">
     <Version xmlns="{NS_PWG}">2.9</Version>
     <ContextID>{escape(str(self.subscription_id or ""))}</ContextID>
@@ -649,7 +656,7 @@ class ESCLWalkupScanner:
             effective_shortcut_cfg["_input_source"] = input_source
 
             if (
-                self.current_session_pages
+                self.current_session_documents
                 and self.current_shortcut_cfg != effective_shortcut_cfg
             ):
                 await self.finalize_session()
@@ -707,27 +714,61 @@ class ESCLWalkupScanner:
                 continue
 
             if document_response.status_code == 200:
-                image_data = document_response.content
+                document_data = document_response.content
+                content_type = document_response.headers.get("Content-Type", "unknown")
+                content_location = document_response.headers.get("Content-Location", "")
 
                 try:
-                    with Image.open(io.BytesIO(image_data)) as image:
-                        image.verify()
+                    actual_format = self._detect_document_format(
+                        document_data,
+                        content_type,
+                    )
+                    if actual_format == "pdf":
+                        document_pages = self._pdf_page_count(document_data)
+                    else:
+                        document_pages = self._image_page_count(document_data)
                 except Exception as exc:
                     logger.error(
-                        "Printer returned an invalid image for page %s: %s",
+                        "Printer returned unreadable data for NextDocument #%s: %s. "
+                        "Content-Type=%s, bytes=%s, first_32_bytes=%s, preview=%r",
                         page_num,
                         exc,
+                        content_type,
+                        len(document_data),
+                        document_data[:32].hex(" "),
+                        document_data[:120],
                     )
                     break
+
+                requested_mime = selected["escl_mime"]
+                expected_format = MIME_TO_FORMAT.get(requested_mime)
+                if expected_format and actual_format != expected_format:
+                    logger.warning(
+                        "Printer returned %s although %s was requested. "
+                        "Processing the actual response format.",
+                        actual_format.upper(),
+                        requested_mime,
+                    )
 
                 if not self.current_shortcut_cfg:
                     self.current_shortcut_cfg = dict(effective_shortcut_cfg)
 
-                self.current_session_pages.append(image_data)
+                self.current_session_documents.append({
+                    "data": document_data,
+                    "format": actual_format,
+                    "content_type": content_type,
+                    "content_location": content_location,
+                    "pages": document_pages,
+                })
                 logger.info(
-                    "Downloaded page %s (%s bytes).",
+                    "Downloaded NextDocument #%s: format=%s, Content-Type=%s, "
+                    "pages=%s, bytes=%s%s",
                     page_num,
-                    len(image_data),
+                    actual_format,
+                    content_type,
+                    document_pages,
+                    len(document_data),
+                    f", Content-Location={content_location}" if content_location else "",
                 )
                 page_num += 1
                 continue
@@ -744,139 +785,303 @@ class ESCLWalkupScanner:
             break
 
         logger.info(
-            "Total pages collected in active session: %s",
-            len(self.current_session_pages),
+            "Total response documents collected in active session: %s",
+            len(self.current_session_documents),
         )
 
-    async def finalize_session(self):
-        if not self.current_session_pages:
-            self.current_shortcut_cfg = None
-            return
+    @staticmethod
+    def _detect_document_format(data: bytes, content_type: str) -> str:
+        """Detect the actual payload type from its bytes, not the requested format."""
+        if not data:
+            raise ValueError("NextDocument response body is empty.")
 
-        logger.info(
-            "Finalizing session. Generating PDF for %s page(s)...",
-            len(self.current_session_pages),
-        )
+        # PDF headers are normally at byte zero; allow a small leading offset as
+        # some generators put harmless bytes before the header.
+        if b"%PDF-" in data[:1024]:
+            return "pdf"
 
-        pages = self.current_session_pages
-        cfg = self.current_shortcut_cfg or {
-            "resolution": 300,
-            "output_dir": "/consume",
+        try:
+            with Image.open(io.BytesIO(data)) as image:
+                image_format = (image.format or "").upper()
+                image.verify()
+        except Exception as exc:
+            normalized_type = content_type.split(";", 1)[0].strip().lower()
+            raise ValueError(
+                f"Payload is neither a readable PDF nor a supported image "
+                f"(HTTP Content-Type={normalized_type or 'unknown'}): {exc}"
+            ) from exc
+
+        format_map = {
+            "JPEG": "jpeg",
+            "JPG": "jpeg",
+            "PNG": "png",
+            "TIFF": "tiff",
         }
+        actual_format = format_map.get(image_format)
+        if not actual_format:
+            raise ValueError(
+                f"Unsupported image format {image_format or 'unknown'} "
+                f"(HTTP Content-Type={content_type})."
+            )
+        return actual_format
 
-        self.current_session_pages = []
-        self.current_shortcut_cfg = None
-
+    @staticmethod
+    def _pdf_page_count(data: bytes) -> int:
         try:
-            await asyncio.to_thread(self.save_pdf, pages, cfg)
-        except Exception:
-            logger.exception("Failed to generate PDF for the current scan batch")
+            reader = PdfReader(io.BytesIO(data), strict=False)
+            if reader.is_encrypted:
+                decrypt_result = reader.decrypt("")
+                if not decrypt_result:
+                    raise ValueError("PDF is encrypted and has no empty-password access.")
+            count = len(reader.pages)
+            if count < 1:
+                raise ValueError("PDF contains no pages.")
+            return count
+        except Exception as exc:
+            raise ValueError(f"Invalid PDF payload: {exc}") from exc
 
-    def save_pdf(self, image_buffers: list, shortcut_cfg: dict):
-        output_dir = Path(shortcut_cfg.get("output_dir", "/consume"))
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-        pil_format = shortcut_cfg.get("pil_format", "PDF")
-        ext = shortcut_cfg.get("ext", ".pdf")
-
-        pil_images = []
-        temp_path = None
-
+    @staticmethod
+    def _image_page_count(data: bytes) -> int:
         try:
-            for index, image_data in enumerate(image_buffers, start=1):
-                try:
-                    with Image.open(io.BytesIO(image_data)) as source_image:
-                        source_image.load()
-                        if pil_format == "JPEG" and source_image.mode not in ("L", "RGB"):
-                            pil_images.append(source_image.convert("RGB"))
-                        else:
-                            pil_images.append(source_image.copy())
-                except Exception as exc:
-                    raise ValueError(
-                        f"Could not decode scanned page {index}: {exc}"
-                    ) from exc
+            with Image.open(io.BytesIO(data)) as image:
+                return int(getattr(image, "n_frames", 1))
+        except Exception as exc:
+            raise ValueError(f"Invalid image payload: {exc}") from exc
 
-            if not pil_images:
-                logger.warning("No valid pages to save.")
-                return
+    @staticmethod
+    def _load_image_frames(document: dict) -> list:
+        """Decode every frame/page from a raster response (e.g. multi-page TIFF)."""
+        images = []
+        try:
+            with Image.open(io.BytesIO(document["data"])) as source:
+                frame_count = int(getattr(source, "n_frames", 1))
+                for frame_index in range(frame_count):
+                    source.seek(frame_index)
+                    source.load()
+                    images.append(source.copy())
+        except Exception as exc:
+            for image in images:
+                image.close()
+            raise ValueError(
+                f"Could not decode {document.get('format', 'image')} response: {exc}"
+            ) from exc
+        return images
 
-            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-            resolution = int(shortcut_cfg.get("resolution", 300))
+    @staticmethod
+    def _prepare_pdf_image(image: Image.Image) -> Image.Image:
+        """Return an independent PDF-compatible L/RGB image."""
+        if image.mode in ("1", "L", "RGB"):
+            return image.copy()
+        return image.convert("RGB")
 
-            if pil_format in ("PDF", "TIFF"):
-                filename = f"scan_{timestamp}_{uuid.uuid4().hex[:6]}{ext}"
-                target_path = output_dir / filename
+    def _image_document_to_pdf(self, document: dict, resolution: int) -> tuple[bytes, int]:
+        images = self._load_image_frames(document)
+        pdf_images = []
+        try:
+            for image in images:
+                pdf_images.append(self._prepare_pdf_image(image))
+            if not pdf_images:
+                raise ValueError("Image response contains no frames.")
 
-                with tempfile.NamedTemporaryFile(
-                    mode="wb",
-                    suffix=f"{ext}.tmp",
-                    prefix=".scan_",
-                    dir=output_dir,
-                    delete=False,
-                ) as temp_file:
-                    temp_path = Path(temp_file.name)
-
-                pil_images[0].save(
-                    temp_path,
-                    format=pil_format,
-                    save_all=True,
-                    append_images=pil_images[1:],
-                    resolution=resolution,
-                )
-
-                os.replace(temp_path, target_path)
-                temp_path = None
-
-                try:
-                    os.chown(target_path, self.puid, self.pgid)
-                    logger.info(
-                        "Set file ownership to UID: %s, GID: %s",
-                        self.puid,
-                        self.pgid,
-                    )
-                except (PermissionError, OSError) as exc:
-                    logger.warning("Could not set file ownership: %s", exc)
-
-                logger.info("File saved successfully: %s", target_path)
-            else:
-                for idx, img in enumerate(pil_images, start=1):
-                    page_suffix = f"_p{idx}" if len(pil_images) > 1 else ""
-                    filename = f"scan_{timestamp}_{uuid.uuid4().hex[:6]}{page_suffix}{ext}"
-                    target_path = output_dir / filename
-
-                    with tempfile.NamedTemporaryFile(
-                        mode="wb",
-                        suffix=f"{ext}.tmp",
-                        prefix=".scan_",
-                        dir=output_dir,
-                        delete=False,
-                    ) as temp_file:
-                        temp_path = Path(temp_file.name)
-
-                    img.save(temp_path, format=pil_format, resolution=resolution)
-
-                    os.replace(temp_path, target_path)
-                    temp_path = None
-
-                    try:
-                        os.chown(target_path, self.puid, self.pgid)
-                    except (PermissionError, OSError) as exc:
-                        logger.warning("Could not set file ownership: %s", exc)
-
-                    logger.info("Page saved successfully: %s", target_path)
-
+            output = io.BytesIO()
+            pdf_images[0].save(
+                output,
+                format="PDF",
+                save_all=True,
+                append_images=pdf_images[1:],
+                resolution=int(resolution),
+            )
+            return output.getvalue(), len(pdf_images)
         finally:
-            for image in pil_images:
+            for image in images + pdf_images:
                 try:
                     image.close()
                 except Exception:
                     pass
 
+    def _documents_to_pdf(self, documents: list, resolution: int) -> tuple[bytes, int]:
+        """Create one PDF, preserving native PDF pages and converting raster pages."""
+        if len(documents) == 1 and documents[0]["format"] == "pdf":
+            data = documents[0]["data"]
+            return data, self._pdf_page_count(data)
+
+        writer = PdfWriter()
+        readers = []  # Keep readers alive until writer.write() completes.
+        total_pages = 0
+        try:
+            for document_index, document in enumerate(documents, start=1):
+                if document["format"] == "pdf":
+                    pdf_data = document["data"]
+                else:
+                    pdf_data, _ = self._image_document_to_pdf(document, resolution)
+
+                reader = PdfReader(io.BytesIO(pdf_data), strict=False)
+                if reader.is_encrypted:
+                    if not reader.decrypt(""):
+                        raise ValueError(
+                            f"PDF response {document_index} is encrypted and cannot be opened."
+                        )
+                readers.append(reader)
+                for page in reader.pages:
+                    writer.add_page(page)
+                    total_pages += 1
+
+            if total_pages < 1:
+                raise ValueError("No pages were available to write to the PDF.")
+
+            output = io.BytesIO()
+            writer.write(output)
+            return output.getvalue(), total_pages
+        finally:
+            writer.close()
+
+    def _atomic_write(self, output_dir: Path, filename: str, data: bytes) -> Path:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        target_path = output_dir / filename
+        temp_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                suffix=".tmp",
+                prefix=".scan_",
+                dir=output_dir,
+                delete=False,
+            ) as temp_file:
+                temp_path = Path(temp_file.name)
+                temp_file.write(data)
+                temp_file.flush()
+                os.fsync(temp_file.fileno())
+
+            os.replace(temp_path, target_path)
+            temp_path = None
+
+            try:
+                os.chown(target_path, self.puid, self.pgid)
+            except (PermissionError, OSError) as exc:
+                logger.warning(
+                    "Could not set file ownership to UID:GID %s:%s: %s",
+                    self.puid,
+                    self.pgid,
+                    exc,
+                )
+            return target_path
+        finally:
             if temp_path and temp_path.exists():
                 try:
                     temp_path.unlink()
                 except OSError:
                     logger.warning("Could not remove temporary file: %s", temp_path)
+
+    def save_documents(self, documents: list, shortcut_cfg: dict):
+        """Save the collected eSCL documents in the configured output format."""
+        if not documents:
+            raise ValueError("No scan documents were collected.")
+
+        output_dir = Path(shortcut_cfg.get("output_dir", "/consume"))
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        pil_format = str(shortcut_cfg.get("pil_format", "PDF")).upper()
+        ext = shortcut_cfg.get("ext", ".pdf")
+        resolution = int(shortcut_cfg.get("resolution", 300))
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        file_id = uuid.uuid4().hex[:6]
+        formats = {document["format"] for document in documents}
+
+        if pil_format == "PDF":
+            pdf_data, page_count = self._documents_to_pdf(documents, resolution)
+            filename = f"scan_{timestamp}_{file_id}{ext}"
+            target_path = self._atomic_write(output_dir, filename, pdf_data)
+            logger.info("PDF saved successfully: %s (%s page(s))", target_path, page_count)
+            return target_path, page_count
+
+        if "pdf" in formats:
+            raise ValueError(
+                f"Printer returned PDF but shortcut requests {pil_format}; "
+                "automatic PDF-to-image conversion is not enabled. "
+                "Set this shortcut's format to 'pdf' to preserve the scan."
+            )
+
+        all_images = []
+        try:
+            for document in documents:
+                all_images.extend(self._load_image_frames(document))
+
+            if not all_images:
+                raise ValueError("No raster pages were available to save.")
+
+            if pil_format == "TIFF":
+                filename = f"scan_{timestamp}_{file_id}{ext}"
+                output = io.BytesIO()
+                all_images[0].save(
+                    output,
+                    format="TIFF",
+                    save_all=True,
+                    append_images=all_images[1:],
+                    resolution=resolution,
+                )
+                target_path = self._atomic_write(output_dir, filename, output.getvalue())
+                logger.info("TIFF saved successfully: %s (%s page(s))", target_path, len(all_images))
+                return target_path, len(all_images)
+
+            if pil_format not in ("JPEG", "PNG"):
+                raise ValueError(f"Unsupported output image format: {pil_format}")
+
+            saved_paths = []
+            for index, image in enumerate(all_images, start=1):
+                output_image = image
+                converted = None
+                try:
+                    if pil_format == "JPEG" and image.mode not in ("L", "RGB"):
+                        converted = image.convert("RGB")
+                        output_image = converted
+
+                    suffix = f"_p{index}" if len(all_images) > 1 else ""
+                    filename = f"scan_{timestamp}_{file_id}{suffix}{ext}"
+                    output = io.BytesIO()
+                    output_image.save(output, format=pil_format, resolution=resolution)
+                    target_path = self._atomic_write(output_dir, filename, output.getvalue())
+                    saved_paths.append(target_path)
+                    logger.info("Image saved successfully: %s", target_path)
+                finally:
+                    if converted is not None:
+                        converted.close()
+
+            return saved_paths[0], len(saved_paths)
+        finally:
+            for image in all_images:
+                try:
+                    image.close()
+                except Exception:
+                    pass
+
+    async def finalize_session(self):
+        if not self.current_session_documents:
+            self.current_shortcut_cfg = None
+            return
+
+        logger.info(
+            "Finalizing session. Processing %s response document(s)...",
+            len(self.current_session_documents),
+        )
+
+        documents = self.current_session_documents
+        cfg = self.current_shortcut_cfg or {
+            "resolution": 300,
+            "output_dir": "/consume",
+            "pil_format": "PDF",
+            "ext": ".pdf",
+        }
+
+        self.current_session_documents = []
+        self.current_shortcut_cfg = None
+
+        try:
+            output_path, page_count = await asyncio.to_thread(
+                self.save_documents, documents, cfg
+            )
+            logger.info("Scan output saved: %s (%s page(s))", output_path, page_count)
+        except Exception:
+            logger.exception("Failed to save the current scan session")
 
     async def poll_events(self):
         if not self.subscription_url:
@@ -901,7 +1106,7 @@ class ESCLWalkupScanner:
                     event_type = find_text(root, "Event") or ""
                     if event_type == "HostSelected":
                         logger.info("Host selected on printer panel.")
-                        if self.current_session_pages:
+                        if self.current_session_documents:
                             await self.finalize_session()
 
                     elif event_type == "ScanRequested":

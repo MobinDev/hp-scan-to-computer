@@ -1,6 +1,6 @@
 {
   "printer_url": "https://192.168.2.199:443",
-  "host_identifier": "Debian-Homelab (Paperless-Scanner)",
+  "host_identifier": "Homelab-Scanner",
   "verify_ssl": false,
   "puid": 1000,
   "pgid": 1000,
@@ -9,16 +9,34 @@
     "paperless": {
       "duplex": false,
       "paper_size": "A4",
+      "format": "pdf",
       "resolution": 300,
       "color_mode": "RGB24",
       "output_dir": "/consume"
     },
     "paperless duplex": {
-      "duplex": false,
+      "duplex": true,
       "paper_size": "A4",
+      "format": "pdf",
       "resolution": 300,
       "color_mode": "RGB24",
       "output_dir": "/consume/double-sided"
+    },
+    "small documents": {
+      "duplex": false,
+      "paper_size": "A5",
+      "format": "pdf",
+      "resolution": 300,
+      "color_mode": "Grayscale8",
+      "output_dir": "/consume"
+    },
+    "photos": {
+      "duplex": false,
+      "paper_size": "A6",
+      "format": "jpg",
+      "resolution": 600,
+      "color_mode": "RGB24",
+      "output_dir": "/nextcloud/photos"
     }
   }
 }
