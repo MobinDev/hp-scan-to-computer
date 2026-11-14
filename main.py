@@ -1,10 +1,10 @@
 import asyncio
 import datetime
-import io
 import json
 import logging
 import os
 import signal
+import shutil
 import sys
 import tempfile
 import uuid
@@ -212,6 +212,7 @@ class ESCLWalkupScanner:
 
         self.current_session_documents = []
         self.current_shortcut_cfg = None
+        self.session_temp_dir = None
 
     async def get_scanner_capabilities(self) -> dict:
         if self.capabilities_cache is not None:
@@ -703,41 +704,61 @@ class ESCLWalkupScanner:
         page_num = 1
 
         while self.running:
+            document_path = None
             try:
-                document_response = await self.client.get(next_document_url)
+                async with self.client.stream("GET", next_document_url) as document_response:
+                    status_code = document_response.status_code
+                    content_type = document_response.headers.get("Content-Type", "unknown")
+                    content_location = document_response.headers.get("Content-Location", "")
+
+                    if status_code == 200:
+                        if self.session_temp_dir is None:
+                            self.session_temp_dir = Path(tempfile.mkdtemp(prefix="hp-scan-session-"))
+                        fd, path_string = tempfile.mkstemp(
+                            prefix=f"document_{page_num:04d}_",
+                            suffix=".bin",
+                            dir=self.session_temp_dir,
+                        )
+                        os.close(fd)
+                        document_path = Path(path_string)
+                        downloaded_bytes = 0
+                        with document_path.open("wb") as output_file:
+                            async for chunk in document_response.aiter_bytes(64 * 1024):
+                                output_file.write(chunk)
+                                downloaded_bytes += len(chunk)
+                    else:
+                        await document_response.aread()
+                        error_preview = document_response.text[:500]
+
             except httpx.HTTPError as exc:
                 logger.error("Network error fetching page %s: %s", page_num, exc)
+                if document_path and document_path.exists():
+                    document_path.unlink(missing_ok=True)
                 break
 
-            if document_response.status_code == 503:
+            if status_code == 503:
+                if document_path and document_path.exists():
+                    document_path.unlink(missing_ok=True)
                 await asyncio.sleep(1)
                 continue
 
-            if document_response.status_code == 200:
-                document_data = document_response.content
-                content_type = document_response.headers.get("Content-Type", "unknown")
-                content_location = document_response.headers.get("Content-Location", "")
-
+            if status_code == 200:
                 try:
-                    actual_format = self._detect_document_format(
-                        document_data,
-                        content_type,
-                    )
+                    actual_format = self._detect_document_format(document_path, content_type)
                     if actual_format == "pdf":
-                        document_pages = self._pdf_page_count(document_data)
+                        document_pages = self._pdf_page_count(document_path)
                     else:
-                        document_pages = self._image_page_count(document_data)
+                        document_pages = self._image_page_count(document_path)
                 except Exception as exc:
+                    with document_path.open("rb") as source_file:
+                        preview = source_file.read(120)
                     logger.error(
                         "Printer returned unreadable data for NextDocument #%s: %s. "
                         "Content-Type=%s, bytes=%s, first_32_bytes=%s, preview=%r",
-                        page_num,
-                        exc,
-                        content_type,
-                        len(document_data),
-                        document_data[:32].hex(" "),
-                        document_data[:120],
+                        page_num, exc, content_type, downloaded_bytes,
+                        preview[:32].hex(" "), preview,
                     )
+                    document_path.unlink(missing_ok=True)
                     break
 
                 requested_mime = selected["escl_mime"]
@@ -754,7 +775,7 @@ class ESCLWalkupScanner:
                     self.current_shortcut_cfg = dict(effective_shortcut_cfg)
 
                 self.current_session_documents.append({
-                    "data": document_data,
+                    "path": document_path,
                     "format": actual_format,
                     "content_type": content_type,
                     "content_location": content_location,
@@ -767,20 +788,20 @@ class ESCLWalkupScanner:
                     actual_format,
                     content_type,
                     document_pages,
-                    len(document_data),
+                    downloaded_bytes,
                     f", Content-Location={content_location}" if content_location else "",
                 )
                 page_num += 1
                 continue
 
-            if document_response.status_code == 404:
+            if status_code == 404:
                 logger.info("All pages for this ScanJob have been received.")
                 break
 
             logger.error(
                 "Unexpected NextDocument response: HTTP %s\n%s",
-                document_response.status_code,
-                document_response.text[:500],
+                status_code,
+                error_preview,
             )
             break
 
@@ -790,18 +811,18 @@ class ESCLWalkupScanner:
         )
 
     @staticmethod
-    def _detect_document_format(data: bytes, content_type: str) -> str:
-        """Detect the actual payload type from its bytes, not the requested format."""
-        if not data:
+    def _detect_document_format(path: Path, content_type: str) -> str:
+        """Detect the actual payload type from a disk-backed response."""
+        if not path.is_file() or path.stat().st_size == 0:
             raise ValueError("NextDocument response body is empty.")
 
-        # PDF headers are normally at byte zero; allow a small leading offset as
-        # some generators put harmless bytes before the header.
-        if b"%PDF-" in data[:1024]:
+        with path.open("rb") as source:
+            header = source.read(1024)
+        if b"%PDF-" in header:
             return "pdf"
 
         try:
-            with Image.open(io.BytesIO(data)) as image:
+            with Image.open(path) as image:
                 image_format = (image.format or "").upper()
                 image.verify()
         except Exception as exc:
@@ -811,12 +832,7 @@ class ESCLWalkupScanner:
                 f"(HTTP Content-Type={normalized_type or 'unknown'}): {exc}"
             ) from exc
 
-        format_map = {
-            "JPEG": "jpeg",
-            "JPG": "jpeg",
-            "PNG": "png",
-            "TIFF": "tiff",
-        }
+        format_map = {"JPEG": "jpeg", "JPG": "jpeg", "PNG": "png", "TIFF": "tiff"}
         actual_format = format_map.get(image_format)
         if not actual_format:
             raise ValueError(
@@ -826,13 +842,11 @@ class ESCLWalkupScanner:
         return actual_format
 
     @staticmethod
-    def _pdf_page_count(data: bytes) -> int:
+    def _pdf_page_count(path: Path) -> int:
         try:
-            reader = PdfReader(io.BytesIO(data), strict=False)
-            if reader.is_encrypted:
-                decrypt_result = reader.decrypt("")
-                if not decrypt_result:
-                    raise ValueError("PDF is encrypted and has no empty-password access.")
+            reader = PdfReader(str(path), strict=False)
+            if reader.is_encrypted and not reader.decrypt(""):
+                raise ValueError("PDF is encrypted and has no empty-password access.")
             count = len(reader.pages)
             if count < 1:
                 raise ValueError("PDF contains no pages.")
@@ -841,19 +855,19 @@ class ESCLWalkupScanner:
             raise ValueError(f"Invalid PDF payload: {exc}") from exc
 
     @staticmethod
-    def _image_page_count(data: bytes) -> int:
+    def _image_page_count(path: Path) -> int:
         try:
-            with Image.open(io.BytesIO(data)) as image:
+            with Image.open(path) as image:
                 return int(getattr(image, "n_frames", 1))
         except Exception as exc:
             raise ValueError(f"Invalid image payload: {exc}") from exc
 
     @staticmethod
     def _load_image_frames(document: dict) -> list:
-        """Decode every frame/page from a raster response (e.g. multi-page TIFF)."""
+        """Decode frames from a disk-backed raster response."""
         images = []
         try:
-            with Image.open(io.BytesIO(document["data"])) as source:
+            with Image.open(document["path"]) as source:
                 frame_count = int(getattr(source, "n_frames", 1))
                 for frame_index in range(frame_count):
                     source.seek(frame_index)
@@ -868,30 +882,31 @@ class ESCLWalkupScanner:
         return images
 
     @staticmethod
+    def _make_temp_path(directory: Path, prefix: str, suffix: str) -> Path:
+        fd, path = tempfile.mkstemp(prefix=prefix, suffix=suffix, dir=directory)
+        os.close(fd)
+        return Path(path)
+
+    @staticmethod
     def _prepare_pdf_image(image: Image.Image) -> Image.Image:
-        """Return an independent PDF-compatible L/RGB image."""
         if image.mode in ("1", "L", "RGB"):
             return image.copy()
         return image.convert("RGB")
 
-    def _image_document_to_pdf(self, document: dict, resolution: int) -> tuple[bytes, int]:
+    def _image_document_to_pdf(self, document: dict, resolution: int) -> tuple[Path, int]:
         images = self._load_image_frames(document)
         pdf_images = []
+        output_path = self._make_temp_path(self.session_temp_dir, "converted_", ".pdf")
         try:
             for image in images:
                 pdf_images.append(self._prepare_pdf_image(image))
             if not pdf_images:
                 raise ValueError("Image response contains no frames.")
-
-            output = io.BytesIO()
             pdf_images[0].save(
-                output,
-                format="PDF",
-                save_all=True,
-                append_images=pdf_images[1:],
-                resolution=int(resolution),
+                output_path, format="PDF", save_all=True,
+                append_images=pdf_images[1:], resolution=int(resolution),
             )
-            return output.getvalue(), len(pdf_images)
+            return output_path, len(pdf_images)
         finally:
             for image in images + pdf_images:
                 try:
@@ -899,28 +914,28 @@ class ESCLWalkupScanner:
                 except Exception:
                     pass
 
-    def _documents_to_pdf(self, documents: list, resolution: int) -> tuple[bytes, int]:
-        """Create one PDF, preserving native PDF pages and converting raster pages."""
+    def _documents_to_pdf(self, documents: list, resolution: int) -> tuple[Path, int]:
+        """Create a PDF on disk, avoiding an in-memory copy of the final document."""
         if len(documents) == 1 and documents[0]["format"] == "pdf":
-            data = documents[0]["data"]
-            return data, self._pdf_page_count(data)
+            path = Path(documents[0]["path"])
+            return path, self._pdf_page_count(path)
 
         writer = PdfWriter()
-        readers = []  # Keep readers alive until writer.write() completes.
+        readers = []
         total_pages = 0
+        output_path = self._make_temp_path(self.session_temp_dir, "merged_", ".pdf")
         try:
             for document_index, document in enumerate(documents, start=1):
                 if document["format"] == "pdf":
-                    pdf_data = document["data"]
+                    pdf_path = Path(document["path"])
                 else:
-                    pdf_data, _ = self._image_document_to_pdf(document, resolution)
+                    pdf_path, _ = self._image_document_to_pdf(document, resolution)
 
-                reader = PdfReader(io.BytesIO(pdf_data), strict=False)
-                if reader.is_encrypted:
-                    if not reader.decrypt(""):
-                        raise ValueError(
-                            f"PDF response {document_index} is encrypted and cannot be opened."
-                        )
+                reader = PdfReader(str(pdf_path), strict=False)
+                if reader.is_encrypted and not reader.decrypt(""):
+                    raise ValueError(
+                        f"PDF response {document_index} is encrypted and cannot be opened."
+                    )
                 readers.append(reader)
                 for page in reader.pages:
                     writer.add_page(page)
@@ -928,41 +943,34 @@ class ESCLWalkupScanner:
 
             if total_pages < 1:
                 raise ValueError("No pages were available to write to the PDF.")
-
-            output = io.BytesIO()
-            writer.write(output)
-            return output.getvalue(), total_pages
+            with output_path.open("wb") as output:
+                writer.write(output)
+            return output_path, total_pages
         finally:
             writer.close()
 
-    def _atomic_write(self, output_dir: Path, filename: str, data: bytes) -> Path:
+    def _atomic_copy(self, output_dir: Path, filename: str, source_path: Path) -> Path:
         output_dir.mkdir(parents=True, exist_ok=True)
         target_path = output_dir / filename
         temp_path = None
         try:
             with tempfile.NamedTemporaryFile(
-                mode="wb",
-                suffix=".tmp",
-                prefix=".scan_",
-                dir=output_dir,
-                delete=False,
+                mode="wb", suffix=".tmp", prefix=".scan_",
+                dir=output_dir, delete=False,
             ) as temp_file:
                 temp_path = Path(temp_file.name)
-                temp_file.write(data)
+                with Path(source_path).open("rb") as source_file:
+                    shutil.copyfileobj(source_file, temp_file, length=1024 * 1024)
                 temp_file.flush()
                 os.fsync(temp_file.fileno())
-
             os.replace(temp_path, target_path)
             temp_path = None
-
             try:
                 os.chown(target_path, self.puid, self.pgid)
             except (PermissionError, OSError) as exc:
                 logger.warning(
                     "Could not set file ownership to UID:GID %s:%s: %s",
-                    self.puid,
-                    self.pgid,
-                    exc,
+                    self.puid, self.pgid, exc,
                 )
             return target_path
         finally:
@@ -988,9 +996,9 @@ class ESCLWalkupScanner:
         formats = {document["format"] for document in documents}
 
         if pil_format == "PDF":
-            pdf_data, page_count = self._documents_to_pdf(documents, resolution)
+            pdf_path, page_count = self._documents_to_pdf(documents, resolution)
             filename = f"scan_{timestamp}_{file_id}{ext}"
-            target_path = self._atomic_write(output_dir, filename, pdf_data)
+            target_path = self._atomic_copy(output_dir, filename, pdf_path)
             logger.info("PDF saved successfully: %s (%s page(s))", target_path, page_count)
             return target_path, page_count
 
@@ -1011,15 +1019,12 @@ class ESCLWalkupScanner:
 
             if pil_format == "TIFF":
                 filename = f"scan_{timestamp}_{file_id}{ext}"
-                output = io.BytesIO()
+                temp_output = self._make_temp_path(self.session_temp_dir, "output_", ".tif")
                 all_images[0].save(
-                    output,
-                    format="TIFF",
-                    save_all=True,
-                    append_images=all_images[1:],
-                    resolution=resolution,
+                    temp_output, format="TIFF", save_all=True,
+                    append_images=all_images[1:], resolution=resolution,
                 )
-                target_path = self._atomic_write(output_dir, filename, output.getvalue())
+                target_path = self._atomic_copy(output_dir, filename, temp_output)
                 logger.info("TIFF saved successfully: %s (%s page(s))", target_path, len(all_images))
                 return target_path, len(all_images)
 
@@ -1037,9 +1042,9 @@ class ESCLWalkupScanner:
 
                     suffix = f"_p{index}" if len(all_images) > 1 else ""
                     filename = f"scan_{timestamp}_{file_id}{suffix}{ext}"
-                    output = io.BytesIO()
-                    output_image.save(output, format=pil_format, resolution=resolution)
-                    target_path = self._atomic_write(output_dir, filename, output.getvalue())
+                    temp_output = self._make_temp_path(self.session_temp_dir, "output_", ext)
+                    output_image.save(temp_output, format=pil_format, resolution=resolution)
+                    target_path = self._atomic_copy(output_dir, filename, temp_output)
                     saved_paths.append(target_path)
                     logger.info("Image saved successfully: %s", target_path)
                 finally:
@@ -1057,6 +1062,10 @@ class ESCLWalkupScanner:
     async def finalize_session(self):
         if not self.current_session_documents:
             self.current_shortcut_cfg = None
+            temp_dir = self.session_temp_dir
+            self.session_temp_dir = None
+            if temp_dir and temp_dir.exists():
+                await asyncio.to_thread(shutil.rmtree, temp_dir, True)
             return
 
         logger.info(
@@ -1074,6 +1083,7 @@ class ESCLWalkupScanner:
 
         self.current_session_documents = []
         self.current_shortcut_cfg = None
+        self.session_temp_dir = None
 
         try:
             output_path, page_count = await asyncio.to_thread(
@@ -1082,6 +1092,11 @@ class ESCLWalkupScanner:
             logger.info("Scan output saved: %s (%s page(s))", output_path, page_count)
         except Exception:
             logger.exception("Failed to save the current scan session")
+        finally:
+            temp_dir = self.session_temp_dir
+            self.session_temp_dir = None
+            if temp_dir and temp_dir.exists():
+                await asyncio.to_thread(shutil.rmtree, temp_dir, True)
 
     async def poll_events(self):
         if not self.subscription_url:
